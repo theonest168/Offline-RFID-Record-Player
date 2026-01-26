@@ -30,7 +30,7 @@ LONG_LIFT_MIN = 1.5         # if lifted >= this, treat as normal pause (no track
 # Previous behavior (seconds)
 # If you're > this many seconds into the track: "previous" restarts current.
 # If you're <= this (e.g., right after restart), "previous" goes to previous track.
-PREV_RESTART_THRESHOLD = 3.0
+PREV_RESTART_THRESHOLD = 5.0
 # ==========================================================
 
 
@@ -222,7 +222,34 @@ class MPVController:
             self._command("stop")
 
     def next_track(self):
+        """
+        Next track with wrap-around:
+        - If playlist has a next item: go next
+        - If at end of playlist: jump to first and start at 0s
+        - If single file: restart from beginning
+        """
         with self._lock:
+            count = self._get_property("playlist-count")
+            pos = self._get_property("playlist-pos")  # 0-based index
+
+            try:
+                count = int(count) if count is not None else 0
+                pos = int(pos) if pos is not None else 0
+            except Exception:
+                count, pos = 0, 0
+
+            if count <= 1:
+                # Single file (or no playlist) -> restart
+                self._command("seek", 0, "absolute", "exact")
+                return
+
+            if pos >= count - 1:
+                # Last track -> wrap to first
+                self._set_property("playlist-pos", 0)
+                self._command("seek", 0, "absolute", "exact")
+                return
+
+            # Normal next
             self._command("playlist-next", "force")
 
     def prev_track(self):
