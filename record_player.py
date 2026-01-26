@@ -20,6 +20,19 @@ PLAYLIST_EXTS = {".m3u", ".m3u8"}
 MPV_SOCKET = "/tmp/rfid_record_player_mpv.sock"
 MPV_PLAYLIST_TMP = "/tmp/rfid_record_player_playlist.m3u"
 
+# ==========================================================
+# Gesture timing (seconds)  <-- tweak these to taste
+# ==========================================================
+SHORT_LIFT_MAX = 0.6        # quick lift must be <= this to count as a "gesture"
+DOUBLE_LIFT_WINDOW = 0.8    # time allowed for a 2nd quick lift (double-lift)
+LONG_LIFT_MIN = 1.5         # if lifted >= this, treat as normal pause (no track skip)
+
+# Previous behavior (seconds)
+# If you're > this many seconds into the track: "previous" restarts current.
+# If you're <= this (e.g., right after restart), "previous" goes to previous track.
+PREV_RESTART_THRESHOLD = 3.0
+# ==========================================================
+
 
 def _list_audio_files(folder: str):
     files = []
@@ -41,24 +54,21 @@ def _write_m3u(path_list, out_path):
 class MPVController:
     """
     Headless mpv controller with IPC.
-    - pause/resume is reliable
+    - pause/resume reliable
     - can seek to resume position
-    - audio output goes to system default (Bluetooth speaker if configured as default sink)
+    - output goes to system default audio sink (Bluetooth if set as default)
     """
 
     def __init__(self):
         self.rfid_map = self._load_rfid_map()
         self.playback_cache = {
-            # last "target" can be a folder/file/playlist path (string)
-            "target": None,
-            # resume info
-            "file": None,
-            "time_pos": 0.0,
+            "target": None,   # mapped target path (folder/file/playlist)
+            "file": None,     # current file path
+            "time_pos": 0.0,  # seconds
         }
 
         self._proc = None
         self._lock = threading.Lock()
-
         self._ensure_mpv()
 
     def _load_rfid_map(self):
@@ -74,12 +84,7 @@ class MPVController:
             print(f"Error decoding JSON: {e}")
         return {}
 
-    def reload_rfid_map(self):
-        # optional helper if you edit rfid.json while running
-        self.rfid_map = self._load_rfid_map()
-
     def _ensure_mpv(self):
-        # Clean up old socket
         try:
             if os.path.exists(MPV_SOCKET):
                 os.remove(MPV_SOCKET)
@@ -103,7 +108,6 @@ class MPVController:
             stderr=subprocess.DEVNULL,
         )
 
-        # Wait briefly for socket
         for _ in range(50):
             if os.path.exists(MPV_SOCKET):
                 return
@@ -112,9 +116,6 @@ class MPVController:
         raise RuntimeError("mpv IPC socket did not appear. Is mpv installed and runnable?")
 
     def _send(self, command_obj, expect_reply=True, timeout=1.0):
-        """
-        Send a JSON command to mpv IPC and optionally wait for a reply.
-        """
         payload = (json.dumps(command_obj) + "\n").encode("utf-8")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -123,7 +124,6 @@ class MPVController:
             if not expect_reply:
                 return None
             data = b""
-            # mpv replies with one JSON line per command
             while b"\n" not in data:
                 chunk = s.recv(4096)
                 if not chunk:
@@ -137,6 +137,9 @@ class MPVController:
             except Exception:
                 return None
 
+    def _command(self, *args):
+        return self._send({"command": list(args)}, expect_reply=True)
+
     def _get_property(self, prop):
         resp = self._send({"command": ["get_property", prop]})
         if resp and resp.get("error") == "success":
@@ -146,16 +149,7 @@ class MPVController:
     def _set_property(self, prop, value):
         return self._send({"command": ["set_property", prop, value]}, expect_reply=True)
 
-    def _command(self, *args):
-        return self._send({"command": list(args)}, expect_reply=True)
-
     def _resolve_target_to_play_arg(self, target_path: str):
-        """
-        Returns a playable argument for mpv:
-        - If folder: create a temp m3u playlist of all audio files
-        - If .m3u/.m3u8: use as-is
-        - If file: use as-is
-        """
         p = os.path.expanduser(target_path)
         if os.path.isdir(p):
             files = _list_audio_files(p)
@@ -171,6 +165,18 @@ class MPVController:
 
         return None
 
+    def _try_restore_playlist_entry(self, wanted_path: str, max_steps=200):
+        wanted_path = os.path.expanduser(wanted_path)
+        cur = self._get_property("path")
+        if cur == wanted_path:
+            return True
+        for _ in range(max_steps):
+            self._command("playlist-next", "force")
+            cur = self._get_property("path")
+            if cur == wanted_path:
+                return True
+        return False
+
     def play(self, rfid_id: str):
         target = self.rfid_map.get(str(rfid_id))
         if not target:
@@ -184,7 +190,6 @@ class MPVController:
 
         with self._lock:
             print("Starting playback")
-            # Load new file/playlist
             self._command("loadfile", play_arg, "replace")
 
             # Resume if same target and we have cached time
@@ -192,40 +197,15 @@ class MPVController:
                 resume_time = float(self.playback_cache.get("time_pos") or 0.0)
                 cached_file = self.playback_cache.get("file")
 
-                # If it’s a playlist, try to restore to the same file first
                 if cached_file:
-                    # mpv playlist entries are file paths; try to jump to it if it exists
-                    # Note: "playlist-play-index" approach is more complex; we do a simple search by cycling.
-                    # For small playlists this is fine.
                     self._try_restore_playlist_entry(cached_file)
 
                 if resume_time > 0.5:
                     print(f"Resuming at {resume_time:.1f}s")
                     self._command("seek", resume_time, "absolute", "exact")
 
-            # Ensure unpaused
             self._set_property("pause", False)
-
-            # Update cache target
             self.playback_cache["target"] = target
-
-    def _try_restore_playlist_entry(self, wanted_path: str, max_steps=200):
-        """
-        Best-effort: move through playlist until current path matches wanted_path.
-        (Only used for resume; harmless if it fails.)
-        """
-        wanted_path = os.path.expanduser(wanted_path)
-        cur = self._get_property("path")
-        if cur == wanted_path:
-            return True
-
-        # Try a limited number of steps forward
-        for _ in range(max_steps):
-            self._command("playlist-next", "force")
-            cur = self._get_property("path")
-            if cur == wanted_path:
-                return True
-        return False
 
     def pause(self):
         with self._lock:
@@ -236,17 +216,8 @@ class MPVController:
         with self._lock:
             self._set_property("pause", False)
 
-    def toggle_pause(self):
-        with self._lock:
-            paused = self._get_property("pause")
-            self._set_property("pause", not bool(paused))
-            if bool(paused) is False:
-                # we were playing, now paused -> store
-                self.store_playback()
-
     def stop(self):
         with self._lock:
-            # Stop playback and go idle
             self.store_playback()
             self._command("stop")
 
@@ -258,20 +229,37 @@ class MPVController:
         with self._lock:
             self._command("playlist-prev", "force")
 
+    def restart_or_prev(self, threshold_seconds: float = PREV_RESTART_THRESHOLD):
+        """
+        If current position > threshold: restart current track.
+        Else: go to previous track.
+        """
+        with self._lock:
+            pos = self._get_property("time-pos")
+            try:
+                pos = float(pos) if pos is not None else 0.0
+            except Exception:
+                pos = 0.0
+
+            if pos > threshold_seconds:
+                print(f"Previous gesture: restart current track (pos={pos:.2f}s)")
+                self._command("seek", 0, "absolute", "exact")
+            else:
+                print(f"Previous gesture: go to previous track (pos={pos:.2f}s)")
+                self._command("playlist-prev", "force")
+
     def store_playback(self):
-        """
-        Cache current playback state so we can resume after pausing (magnet lost).
-        """
         try:
             time_pos = self._get_property("time-pos")
             path = self._get_property("path")
             if time_pos is None:
                 time_pos = 0.0
-
             self.playback_cache["time_pos"] = float(time_pos or 0.0)
             self.playback_cache["file"] = path
-            # target is kept as-is (the mapping key) by play()
-            print(f"Stored playback: target={self.playback_cache.get('target')}, file={path}, time={self.playback_cache['time_pos']:.1f}s")
+            print(
+                f"Stored playback: target={self.playback_cache.get('target')}, "
+                f"file={path}, time={self.playback_cache['time_pos']:.1f}s"
+            )
         except Exception as e:
             print(f"Failed to store playback: {e}")
 
@@ -320,40 +308,110 @@ class StepperMotor:
 
 
 class RecordPlayer:
-    def __init__(self, player, motor, rfid, hall_sensor):
+    """
+    Hall sensor gestures (Option B):
+    - Normal behavior: magnet lost pauses playback; magnet detected resumes.
+    - Quick lift (<= SHORT_LIFT_MAX) then put back:
+        - Single quick lift -> NEXT track (after DOUBLE_LIFT_WINDOW if no second lift)
+        - Double quick lift -> PREVIOUS behavior:
+            * if > PREV_RESTART_THRESHOLD into track -> restart current
+            * else -> previous track
+    - Long lift (>= LONG_LIFT_MIN): normal pause (no skip)
+    """
+
+    def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
         self.player = player
         self.motor = motor
         self.rfid = rfid
         self.hall_sensor = hall_sensor
 
         self.current_rfid = None
-        self.spinning = False
+
+        # Track magnet state transitions
+        self._magnet_present = None
+        self._lift_start_time = None
+
+        # Gesture state
+        self._short_lift_count = 0
+        self._pending_single_deadline = None  # when to execute NEXT if no second lift arrives
+
+    def _reset_gesture(self):
+        self._short_lift_count = 0
+        self._pending_single_deadline = None
+
+    def _maybe_fire_pending_single(self, now: float):
+        if self._pending_single_deadline is not None and now >= self._pending_single_deadline:
+            if self._short_lift_count == 1:
+                print("Gesture: single quick lift -> NEXT track")
+                self.player.next_track()
+                self.player.resume()
+            self._reset_gesture()
 
     def update(self):
-        magnet_detected = self.hall_sensor.value
+        now = time.time()
+        magnet_detected = bool(self.hall_sensor.value)
 
-        if magnet_detected and not self.spinning:
-            print("Magnet detected → start")
-            self.spinning = True
+        # Fire pending single-lift action if window elapsed
+        self._maybe_fire_pending_single(now)
+
+        # Initialize on first run
+        if self._magnet_present is None:
+            self._magnet_present = magnet_detected
+            if magnet_detected:
+                self.motor.start()
+            return
+
+        if magnet_detected and not self._magnet_present:
+            # Magnet returned
+            lift_duration = 0.0
+            if self._lift_start_time is not None:
+                lift_duration = now - self._lift_start_time
+
+            print(f"Magnet detected → start (lift duration {lift_duration:.2f}s)")
             self.motor.start()
+            self.player.resume()
 
-        elif not magnet_detected and self.spinning:
-            print("Magnet lost → stop (pause)")
-            self.spinning = False
-            self.current_rfid = None
+            if lift_duration <= SHORT_LIFT_MAX:
+                self._short_lift_count += 1
+                print(f"Quick lift #{self._short_lift_count}")
+
+                if self._short_lift_count == 1:
+                    self._pending_single_deadline = now + DOUBLE_LIFT_WINDOW
+
+                elif self._short_lift_count >= 2:
+                    print("Gesture: double quick lift -> PREVIOUS (restart-or-prev)")
+                    self.player.restart_or_prev(PREV_RESTART_THRESHOLD)
+                    self.player.resume()
+                    self._reset_gesture()
+
+            elif lift_duration >= LONG_LIFT_MIN:
+                self._reset_gesture()
+            else:
+                self._reset_gesture()
+
+            self._lift_start_time = None
+
+        elif (not magnet_detected) and self._magnet_present:
+            # Magnet lost
+            print("Magnet lost → stop motor + pause")
             self.motor.stop()
             self.player.pause()
+            self._lift_start_time = now
 
-        if self.spinning:
+        self._magnet_present = magnet_detected
+
+        # RFID handling while spinning
+        if magnet_detected:
             rfid_id = self.rfid.read_id_no_block()
-            if rfid_id and rfid_id != self.current_rfid:
+            if rfid_id and str(rfid_id) != str(self.current_rfid):
                 print(f"RFID changed: {rfid_id}")
                 self.current_rfid = rfid_id
+                self._reset_gesture()
                 self.player.play(str(rfid_id))
 
 
 def main():
-    print("Starting Record Player (LOCAL FILES via mpv)")
+    print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures")
     player = MPVController()
     motor = StepperMotor()
     rfid = SimpleMFRC522()
@@ -369,7 +427,7 @@ def main():
     try:
         while True:
             rp.update()
-            time.sleep(0.1)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         print("Shutting down...")
     finally:
