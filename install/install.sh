@@ -1,108 +1,125 @@
-#!/usr/bin/env bash
-set -euo pipefail
+import json
+import os
+from mfrc522 import SimpleMFRC522
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MUSIC_DIR_DEFAULT="/home/pi/Music"
+RFID_FILE = "rfid.json"
 
-# Allow override: MUSIC_DIR=/some/path bash install/install.sh
-MUSIC_DIR="${MUSIC_DIR:-$MUSIC_DIR_DEFAULT}"
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+PLAYLIST_EXTS = {".m3u", ".m3u8"}
 
-echo "== RFID Record Player (Local MP3 / MPD) Installer =="
-echo "Project: $PROJECT_DIR"
-echo "Music dir: $MUSIC_DIR"
-echo
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Please run as root:"
-  echo "  sudo bash install/install.sh"
-  exit 1
-fi
+def read_rfid_file():
+    rfid_map = {}
+    try:
+        with open(RFID_FILE, "r") as f:
+            rfid_map = json.load(f)
+    except FileNotFoundError:
+        print("rfid.json not found, a new one will be created.")
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}")
+    return rfid_map
 
-echo "== Updating apt =="
-apt-get update
 
-echo "== Installing system packages =="
-apt-get install -y \
-  python3 python3-pip python3-venv \
-  git \
-  mpd mpc \
-  pulseaudio pulseaudio-module-bluetooth \
-  bluetooth bluez bluez-tools \
-  lgpio
+def write_rfid_file(rfid_map):
+    with open(RFID_FILE, "w") as json_file:
+        json.dump(rfid_map, json_file, indent=4)
 
-echo "== Creating music directory =="
-# Create as the real user (pi) if possible
-REAL_USER="${SUDO_USER:-pi}"
-REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6 || true)"
-if [[ -z "${REAL_HOME}" ]]; then
-  REAL_HOME="/home/$REAL_USER"
-fi
 
-mkdir -p "$MUSIC_DIR"
-chown -R "$REAL_USER":"$REAL_USER" "$MUSIC_DIR"
+def _looks_like_audio_target(path: str) -> bool:
+    p = os.path.expanduser(path.strip())
+    if not p:
+        return False
+    if os.path.isdir(p):
+        return True
+    if os.path.isfile(p):
+        ext = os.path.splitext(p)[1].lower()
+        return ext in AUDIO_EXTS or ext in PLAYLIST_EXTS
+    return False
 
-echo "== Configuring MPD music directory =="
-MPD_CONF="/etc/mpd.conf"
 
-if [[ ! -f "$MPD_CONF" ]]; then
-  echo "Error: $MPD_CONF not found (mpd install may have failed)."
-  exit 1
-fi
+def write_rfid_tags():
+    rfid = SimpleMFRC522()
+    rfid_map = read_rfid_file()
 
-# Backup once
-if [[ ! -f "${MPD_CONF}.bak" ]]; then
-  cp "$MPD_CONF" "${MPD_CONF}.bak"
-fi
+    print("\nRFID mapping mode (LOCAL FILES)")
+    print("Map an RFID tag to ONE of:")
+    print(" - a folder containing audio files")
+    print(" - a single audio file (.mp3/.flac/...)")
+    print(" - a playlist file (.m3u/.m3u8)\n")
 
-# Set music_directory (replace existing line)
-# Works for both quoted and unquoted formats
-sed -i -E "s|^(\s*music_directory\s+).*|\1\"$MUSIC_DIR\"|g" "$MPD_CONF"
+    while True:
+        print("Please scan RFID tag:")
+        rfid_id = str(rfid.read_id())
 
-# Ensure these core paths are sane (usually already are)
-# Keep MPD's database/state in default system locations.
-# (No-op if already present)
-grep -qE '^\s*playlist_directory' "$MPD_CONF" || echo 'playlist_directory "/var/lib/mpd/playlists"' >> "$MPD_CONF"
-grep -qE '^\s*db_file' "$MPD_CONF" || echo 'db_file "/var/lib/mpd/tag_cache"' >> "$MPD_CONF"
-grep -qE '^\s*state_file' "$MPD_CONF" || echo 'state_file "/var/lib/mpd/state"' >> "$MPD_CONF"
+        print(f"RFID ID {rfid_id} detected.")
+        target = input("Enter local path (folder/file/.m3u): ").strip()
 
-echo "== Enabling & restarting MPD =="
-systemctl enable mpd
-systemctl restart mpd
+        expanded = os.path.expanduser(target)
+        if not _looks_like_audio_target(expanded):
+            print("Invalid path.")
+            print("It must be an existing folder, an existing audio file, or an existing .m3u/.m3u8 playlist.\n")
+        else:
+            rfid_map[rfid_id] = expanded
+            write_rfid_file(rfid_map)
+            print(f"Stored mapping: {rfid_id} -> {expanded}\n")
 
-echo "== Updating MPD database (mpc update) =="
-# Run as the real user so mpc talks to MPD cleanly in typical setups
-sudo -u "$REAL_USER" mpc update || true
+        print("Please choose an option:")
+        print("1. Add another RFID tag")
+        print("2. Exit")
+        choice = input("Enter your choice: ").strip()
+        if choice == "2":
+            break
 
-echo "== Installing Python packages =="
-# Install Python deps system-wide (simple) OR switch to venv if you prefer.
-python3 -m pip install --upgrade pip
 
-python3 -m pip install \
-  gpiozero \
-  mfrc522 \
-  python-dotenv \
-  python-mpd2
+def read_rfid_tags():
+    rfid = SimpleMFRC522()
+    rfid_map = read_rfid_file()
 
-echo "== Optional: PulseAudio auto-switch to Bluetooth sink =="
-PA_DEFAULT="/home/$REAL_USER/.config/pulse/default.pa"
-sudo -u "$REAL_USER" mkdir -p "$(dirname "$PA_DEFAULT")"
+    while True:
+        print("Please scan RFID tag:")
+        rfid_id = str(rfid.read_id())
 
-if [[ -f "$PA_DEFAULT" ]]; then
-  if ! grep -q "module-switch-on-connect" "$PA_DEFAULT"; then
-    echo "load-module module-switch-on-connect" | sudo -u "$REAL_USER" tee -a "$PA_DEFAULT" >/dev/null
-  fi
-else
-  echo "load-module module-switch-on-connect" | sudo -u "$REAL_USER" tee "$PA_DEFAULT" >/dev/null
-fi
+        if rfid_id in rfid_map:
+            print(f"RFID ID {rfid_id} is mapped to: {rfid_map.get(rfid_id)}")
+        else:
+            print(f"RFID ID {rfid_id} is not configured.")
 
-echo
-echo "== Done =="
-echo "Next steps:"
-echo "1) Copy MP3s into: $MUSIC_DIR"
-echo "2) Run: mpc update"
-echo "3) Run setup: python3 install/setup.py   (or wherever your setup.py lives)"
-echo "4) Run player: python3 record_player.py"
-echo
-echo "If you're using Echo over Bluetooth:"
-echo "- Say: 'Alexa, pair Bluetooth'"
-echo "- Pair from Pi with: bluetoothctl"
+        print("Please choose an option:")
+        print("1. Read another RFID tag")
+        print("2. Exit")
+        choice = input("Enter your choice: ").strip()
+        if choice == "2":
+            break
+
+
+def get_user_choice():
+    actions = {
+        "1": ("Write RFID tags (local paths)", write_rfid_tags),
+        "2": ("Read RFID tags", read_rfid_tags),
+    }
+    exit_key = str(len(actions) + 1)
+
+    while True:
+        print("\nPlease choose an option:")
+        for key, (label, _) in actions.items():
+            print(f"{key}. {label}")
+        print(f"{exit_key}. Exit")
+
+        choice = input("Enter your choice: ").strip()
+
+        if choice == exit_key:
+            print("Exiting the program.")
+            break
+
+        action = actions.get(choice)
+        if not action:
+            print("Invalid choice. Please try again.")
+            continue
+
+        label, func = action
+        print(f"You selected: {label}")
+        func()
+
+
+if __name__ == "__main__":
+    get_user_choice()
