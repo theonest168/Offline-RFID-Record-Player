@@ -27,10 +27,10 @@ SHORT_LIFT_MAX = 0.6        # quick lift must be <= this to count as a "gesture"
 DOUBLE_LIFT_WINDOW = 0.8    # time allowed for a 2nd quick lift (double-lift)
 LONG_LIFT_MIN = 1.5         # if lifted >= this, treat as normal pause (no track skip)
 
-# Previous-track behavior (seconds)
-# If current playback time > this → restart current track
-# If current playback time <= this → go to previous track
-PREV_RESTART_THRESHOLD = 5.0
+# Previous behavior (seconds)
+# If you're > this many seconds into the track: "previous" restarts current.
+# If you're <= this (e.g., right after restart), "previous" goes to previous track.
+PREV_RESTART_THRESHOLD = 3.0
 # ==========================================================
 
 
@@ -222,34 +222,8 @@ class MPVController:
             self._command("stop")
 
     def next_track(self):
-        """
-        Next track with wrap-around:
-        - If playlist has a next item: go next
-        - If at end of playlist: go to first and seek to start
-        - If single file: restart the track
-        """
         with self._lock:
-            try:
-                count = self._get_property("playlist-count")
-                pos = self._get_property("playlist-pos")  # 0-based
-                count = int(count) if count is not None else 0
-                pos = int(pos) if pos is not None else 0
-
-                if count <= 1:
-                    # Single track (or no playlist) -> restart
-                    self._command("seek", 0, "absolute", "exact")
-                    return
-
-                if pos >= count - 1:
-                    # End of playlist -> wrap to first
-                    self._set_property("playlist-pos", 0)
-                    self._command("seek", 0, "absolute", "exact")
-                    return
-
-                self._command("playlist-next", "force")
-            except Exception as e:
-                print(f"next_track wrap failed: {e}")
-                self._command("playlist-next", "force")
+            self._command("playlist-next", "force")
 
     def prev_track(self):
         with self._lock:
@@ -336,10 +310,13 @@ class StepperMotor:
 class RecordPlayer:
     """
     Hall sensor gestures (Option B):
-    - Normal: magnet lost pauses; magnet detected resumes.
-    - Single quick lift -> NEXT track (after DOUBLE_LIFT_WINDOW if no second lift)
-    - Double quick lift -> restart-or-prev (see PREV_RESTART_THRESHOLD)
-    - Long lift (>= LONG_LIFT_MIN): normal pause
+    - Normal behavior: magnet lost pauses playback; magnet detected resumes.
+    - Quick lift (<= SHORT_LIFT_MAX) then put back:
+        - Single quick lift -> NEXT track (after DOUBLE_LIFT_WINDOW if no second lift)
+        - Double quick lift -> PREVIOUS behavior:
+            * if > PREV_RESTART_THRESHOLD into track -> restart current
+            * else -> previous track
+    - Long lift (>= LONG_LIFT_MIN): normal pause (no skip)
     """
 
     def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
@@ -350,11 +327,13 @@ class RecordPlayer:
 
         self.current_rfid = None
 
+        # Track magnet state transitions
         self._magnet_present = None
         self._lift_start_time = None
 
+        # Gesture state
         self._short_lift_count = 0
-        self._pending_single_deadline = None
+        self._pending_single_deadline = None  # when to execute NEXT if no second lift arrives
 
     def _reset_gesture(self):
         self._short_lift_count = 0
@@ -372,8 +351,10 @@ class RecordPlayer:
         now = time.time()
         magnet_detected = bool(self.hall_sensor.value)
 
+        # Fire pending single-lift action if window elapsed
         self._maybe_fire_pending_single(now)
 
+        # Initialize on first run
         if self._magnet_present is None:
             self._magnet_present = magnet_detected
             if magnet_detected:
@@ -381,6 +362,7 @@ class RecordPlayer:
             return
 
         if magnet_detected and not self._magnet_present:
+            # Magnet returned
             lift_duration = 0.0
             if self._lift_start_time is not None:
                 lift_duration = now - self._lift_start_time
@@ -395,18 +377,22 @@ class RecordPlayer:
 
                 if self._short_lift_count == 1:
                     self._pending_single_deadline = now + DOUBLE_LIFT_WINDOW
-                else:
+
+                elif self._short_lift_count >= 2:
                     print("Gesture: double quick lift -> PREVIOUS (restart-or-prev)")
                     self.player.restart_or_prev(PREV_RESTART_THRESHOLD)
                     self.player.resume()
                     self._reset_gesture()
+
+            elif lift_duration >= LONG_LIFT_MIN:
+                self._reset_gesture()
             else:
-                # medium/long lift => normal pause/resume
                 self._reset_gesture()
 
             self._lift_start_time = None
 
         elif (not magnet_detected) and self._magnet_present:
+            # Magnet lost
             print("Magnet lost → stop motor + pause")
             self.motor.stop()
             self.player.pause()
@@ -414,6 +400,7 @@ class RecordPlayer:
 
         self._magnet_present = magnet_detected
 
+        # RFID handling while spinning
         if magnet_detected:
             rfid_id = self.rfid.read_id_no_block()
             if rfid_id and str(rfid_id) != str(self.current_rfid):
