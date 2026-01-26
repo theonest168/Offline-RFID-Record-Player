@@ -31,6 +31,10 @@ LONG_LIFT_MIN = 1.5         # if lifted >= this, treat as normal pause (no track
 # If you're > this many seconds into the track: "previous" restarts current.
 # If you're <= this (e.g., right after restart), "previous" goes to previous track.
 PREV_RESTART_THRESHOLD = 5.0
+
+# Full stop after magnet is missing for this long (seconds)
+# 20 minutes => requires re-scan after coming back
+FULL_STOP_AFTER = 20 * 60
 # ==========================================================
 
 
@@ -344,6 +348,12 @@ class RecordPlayer:
             * if > PREV_RESTART_THRESHOLD into track -> restart current
             * else -> previous track
     - Long lift (>= LONG_LIFT_MIN): normal pause (no skip)
+
+    Full stop behavior:
+    - If magnet is missing for >= FULL_STOP_AFTER (20 min):
+        * mpv STOP is executed
+        * current_rfid cleared
+        * requires re-scan to play again
     """
 
     def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
@@ -361,6 +371,9 @@ class RecordPlayer:
         # Gesture state
         self._short_lift_count = 0
         self._pending_single_deadline = None  # when to execute NEXT if no second lift arrives
+
+        # Full stop guard (to avoid calling stop repeatedly)
+        self._full_stop_done = False
 
     def _reset_gesture(self):
         self._short_lift_count = 0
@@ -417,6 +430,7 @@ class RecordPlayer:
                 self._reset_gesture()
 
             self._lift_start_time = None
+            self._full_stop_done = False  # ready for next absence window
 
         elif (not magnet_detected) and self._magnet_present:
             # Magnet lost
@@ -424,8 +438,18 @@ class RecordPlayer:
             self.motor.stop()
             self.player.pause()
             self._lift_start_time = now
+            self._full_stop_done = False
 
         self._magnet_present = magnet_detected
+
+        # Full stop if magnet missing for long time
+        if (not magnet_detected) and self._lift_start_time is not None and (not self._full_stop_done):
+            if (now - self._lift_start_time) >= FULL_STOP_AFTER:
+                print("Magnet missing for 20 minutes → FULL STOP (re-scan required)")
+                self.player.stop()
+                self.current_rfid = None
+                self._reset_gesture()
+                self._full_stop_done = True
 
         # RFID handling while spinning
         if magnet_detected:
