@@ -336,14 +336,9 @@ class StepperMotor:
 
 class RecordPlayer:
     """
-    Hall sensor gestures (Option B):
-    - Normal behavior: magnet lost pauses playback; magnet detected resumes.
-    - Quick lift (<= SHORT_LIFT_MAX) then put back:
-        - Single quick lift -> NEXT track (after DOUBLE_LIFT_WINDOW if no second lift)
-        - Double quick lift -> PREVIOUS behavior:
-            * if > PREV_RESTART_THRESHOLD into track -> restart current
-            * else -> previous track
-    - Long lift (>= LONG_LIFT_MIN): normal pause (no skip)
+    Hall sensor gestures (Option B) + "no music without record":
+    - Playback is allowed ONLY if magnet is present AND an RFID tag is present.
+    - RFID loss is debounced with RFID_MISSING_TIMEOUT to avoid flicker.
     """
 
     def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
@@ -362,6 +357,9 @@ class RecordPlayer:
         self._short_lift_count = 0
         self._pending_single_deadline = None  # when to execute NEXT if no second lift arrives
 
+        # RFID presence tracking (debounce)
+        self._last_rfid_seen_time = 0.0
+
     def _reset_gesture(self):
         self._short_lift_count = 0
         self._pending_single_deadline = None
@@ -371,7 +369,7 @@ class RecordPlayer:
             if self._short_lift_count == 1:
                 print("Gesture: single quick lift -> NEXT track")
                 self.player.next_track()
-                self.player.resume()
+                # resume will only happen if RFID is still present (enforced below)
             self._reset_gesture()
 
     def update(self):
@@ -384,57 +382,95 @@ class RecordPlayer:
         # Initialize on first run
         if self._magnet_present is None:
             self._magnet_present = magnet_detected
-            if magnet_detected:
-                self.motor.start()
             return
 
+        # ----------------------------
+        # Magnet returned
+        # ----------------------------
         if magnet_detected and not self._magnet_present:
-            # Magnet returned
             lift_duration = 0.0
             if self._lift_start_time is not None:
                 lift_duration = now - self._lift_start_time
 
             print(f"Magnet detected → start (lift duration {lift_duration:.2f}s)")
             self.motor.start()
-            self.player.resume()
 
-            if lift_duration <= SHORT_LIFT_MAX:
-                self._short_lift_count += 1
-                print(f"Quick lift #{self._short_lift_count}")
+            # IMPORTANT: do NOT resume blindly.
+            # Only allow audio if an RFID tag is currently present.
+            rfid_id = self.rfid.read_id_no_block()
+            if rfid_id:
+                self._last_rfid_seen_time = now
 
-                if self._short_lift_count == 1:
-                    self._pending_single_deadline = now + DOUBLE_LIFT_WINDOW
-
-                elif self._short_lift_count >= 2:
-                    print("Gesture: double quick lift -> PREVIOUS (restart-or-prev)")
-                    self.player.restart_or_prev(PREV_RESTART_THRESHOLD)
-                    self.player.resume()
+                # If tag changed (or first time), start the mapped content
+                if rfid_id != self.current_rfid:
+                    print(f"RFID detected on start: {rfid_id}")
+                    self.current_rfid = rfid_id
                     self._reset_gesture()
-
-            elif lift_duration >= LONG_LIFT_MIN:
-                self._reset_gesture()
+                    self.player.play(str(rfid_id))
+                else:
+                    # same record -> we can resume (gesture may modify track below)
+                    self.player.resume()
             else:
-                self._reset_gesture()
+                print("No RFID tag present → keep paused (no music without record)")
+                self.current_rfid = None
+                self.player.pause()  # ensure paused
+
+            # Gesture handling (only meaningful if RFID is present)
+            if rfid_id:
+                if lift_duration <= SHORT_LIFT_MAX:
+                    self._short_lift_count += 1
+                    print(f"Quick lift #{self._short_lift_count}")
+
+                    if self._short_lift_count == 1:
+                        self._pending_single_deadline = now + DOUBLE_LIFT_WINDOW
+                    elif self._short_lift_count >= 2:
+                        print("Gesture: double quick lift -> PREVIOUS (restart-or-prev)")
+                        self.player.restart_or_prev(PREV_RESTART_THRESHOLD)
+                        self.player.resume()
+                        self._reset_gesture()
+                else:
+                    self._reset_gesture()
 
             self._lift_start_time = None
 
+        # ----------------------------
+        # Magnet removed
+        # ----------------------------
         elif (not magnet_detected) and self._magnet_present:
-            # Magnet lost
             print("Magnet lost → stop motor + pause")
             self.motor.stop()
             self.player.pause()
             self._lift_start_time = now
+            # We do NOT clear current_rfid here; record might return quickly.
 
         self._magnet_present = magnet_detected
 
-        # RFID handling while spinning
+        # ----------------------------
+        # While magnet present: enforce RFID presence
+        # ----------------------------
         if magnet_detected:
             rfid_id = self.rfid.read_id_no_block()
-            if rfid_id and str(rfid_id) != str(self.current_rfid):
-                print(f"RFID changed: {rfid_id}")
-                self.current_rfid = rfid_id
-                self._reset_gesture()
-                self.player.play(str(rfid_id))
+
+            if rfid_id:
+                self._last_rfid_seen_time = now
+
+                # If RFID changed, play new record
+                if rfid_id != self.current_rfid:
+                    print(f"RFID changed: {rfid_id}")
+                    self.current_rfid = rfid_id
+                    self._reset_gesture()
+                    self.player.play(str(rfid_id))
+
+                # Ensure playing (if previously paused due to missing RFID)
+                self.player.resume()
+
+            else:
+                # No read this cycle; only pause if missing for long enough
+                if self.current_rfid is not None and (now - self._last_rfid_seen_time) > RFID_MISSING_TIMEOUT:
+                    print("RFID missing for too long → pause (no music without record)")
+                    self.current_rfid = None
+                    self._reset_gesture()
+                    self.player.pause()
 
 
 def main():
