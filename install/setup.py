@@ -1,23 +1,38 @@
 import json
 import os
+from datetime import datetime
+
 from mfrc522 import SimpleMFRC522
 
 RFID_FILE = "rfid.json"
-
+AUDIOBOOK_MARKER = "audiobook.json"
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-PLAYLIST_EXTS = {".m3u", ".m3u8"}
+
+
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _list_audio_files(folder: str):
+    files = []
+    for root, _, names in os.walk(folder):
+        for name in names:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in AUDIO_EXTS:
+                files.append(os.path.join(root, name))
+    files.sort(key=lambda p: p.lower())
+    return files
 
 
 def read_rfid_file():
-    rfid_map = {}
     try:
-        with open(RFID_FILE, "r") as f:
-            rfid_map = json.load(f)
+        with open(RFID_FILE, "r") as file:
+            return json.load(file)
     except FileNotFoundError:
-        print("rfid.json not found, a new one will be created.")
+        print("RFID map not found, creating a new one.")
     except json.JSONDecodeError as e:
         print(f"Error decoding JSON: {e}")
-    return rfid_map
+    return {}
 
 
 def write_rfid_file(rfid_map):
@@ -25,46 +40,93 @@ def write_rfid_file(rfid_map):
         json.dump(rfid_map, json_file, indent=4)
 
 
-def _looks_like_audio_target(path: str) -> bool:
-    p = os.path.expanduser(path.strip())
-    if not p:
-        return False
-    if os.path.isdir(p):
-        return True
-    if os.path.isfile(p):
-        ext = os.path.splitext(p)[1].lower()
-        return ext in AUDIO_EXTS or ext in PLAYLIST_EXTS
-    return False
+def _ensure_audiobook_marker(folder: str):
+    marker = os.path.join(folder, AUDIOBOOK_MARKER)
+    if os.path.exists(marker):
+        print(f"'{AUDIOBOOK_MARKER}' already exists (not overwriting).")
+        return
+
+    files = _list_audio_files(folder)
+    if not files:
+        print("No audio files found in this folder; not creating audiobook marker.")
+        return
+
+    rel_first = os.path.relpath(files[0], folder)
+    data = {
+        "type": "audiobook",
+        "version": 1,
+        "current_file": rel_first,
+        "time_pos": 0.0,
+        "updated_at": _now_iso(),
+    }
+    tmp = marker + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, marker)
+    print(f"Created '{AUDIOBOOK_MARKER}' in folder (initialized to first track).")
 
 
-def write_rfid_tags():
+def write_rfid_tags_local():
     rfid = SimpleMFRC522()
     rfid_map = read_rfid_file()
-
-    print("\nRFID mapping mode (LOCAL FILES)")
-    print("Map an RFID tag to ONE of:")
-    print(" - a folder containing audio files")
-    print(" - a single audio file (.mp3/.flac/...)")
-    print(" - a playlist file (.m3u/.m3u8)\n")
 
     while True:
         print("Please scan RFID tag:")
         rfid_id = str(rfid.read_id())
 
-        print(f"RFID ID {rfid_id} detected.")
-        target = input("Enter local path (folder/file/.m3u): ").strip()
+        target = input("Enter local path (file, playlist, or folder): ").strip()
+        if not target:
+            print("Empty path, try again.")
+            continue
 
-        expanded = os.path.expanduser(target)
-        if not _looks_like_audio_target(expanded):
-            print("Invalid path.")
-            print("It must be an existing folder, an existing audio file, or an existing .m3u/.m3u8 playlist.\n")
-        else:
-            rfid_map[rfid_id] = expanded
-            write_rfid_file(rfid_map)
-            print(f"Stored mapping: {rfid_id} -> {expanded}\n")
+        target_exp = os.path.expanduser(target)
+        if not os.path.exists(target_exp):
+            print("Path does not exist.")
+            continue
 
-        print("Please choose an option:")
+        rfid_map[rfid_id] = target
+        write_rfid_file(rfid_map)
+        print(f"Stored local path for RFID ID {rfid_id}")
+
         print("1. Add another RFID tag")
+        print("2. Exit")
+        choice = input("Enter your choice: ").strip()
+        if choice == "2":
+            break
+
+
+def write_rfid_tags_audiobooks():
+    rfid = SimpleMFRC522()
+    rfid_map = read_rfid_file()
+
+    while True:
+        print("Please scan RFID tag:")
+        rfid_id = str(rfid.read_id())
+
+        folder = input("Enter audiobook folder path (must contain audio files): ").strip()
+        if not folder:
+            print("Empty path, try again.")
+            continue
+
+        folder_exp = os.path.expanduser(folder)
+        if not os.path.isdir(folder_exp):
+            print("That is not a folder.")
+            continue
+
+        files = _list_audio_files(folder_exp)
+        if not files:
+            print("No supported audio files found in this folder.")
+            continue
+
+        # map RFID -> folder
+        rfid_map[rfid_id] = folder
+        write_rfid_file(rfid_map)
+        print(f"Stored audiobook folder for RFID ID {rfid_id}")
+
+        # create marker if missing
+        _ensure_audiobook_marker(folder_exp)
+
+        print("1. Add another audiobook RFID tag")
         print("2. Exit")
         choice = input("Enter your choice: ").strip()
         if choice == "2":
@@ -80,11 +142,10 @@ def read_rfid_tags():
         rfid_id = str(rfid.read_id())
 
         if rfid_id in rfid_map:
-            print(f"RFID ID {rfid_id} is mapped to: {rfid_map.get(rfid_id)}")
+            print(f"RFID ID {rfid_id} is mapped to {rfid_map.get(rfid_id)}.")
         else:
             print(f"RFID ID {rfid_id} is not configured.")
 
-        print("Please choose an option:")
         print("1. Read another RFID tag")
         print("2. Exit")
         choice = input("Enter your choice: ").strip()
@@ -94,10 +155,11 @@ def read_rfid_tags():
 
 def get_user_choice():
     actions = {
-        "1": ("Write RFID tags (local paths)", write_rfid_tags),
-        "2": ("Read RFID tags", read_rfid_tags),
+        "1": ("Write RFID tags (local paths)", write_rfid_tags_local),
+        "2": ("Write RFID tags for audiobooks (local paths)", write_rfid_tags_audiobooks),
+        "3": ("Read RFID tags", read_rfid_tags),
     }
-    exit_key = str(len(actions) + 1)
+    exit_key = "4"
 
     while True:
         print("\nPlease choose an option:")
@@ -106,7 +168,6 @@ def get_user_choice():
         print(f"{exit_key}. Exit")
 
         choice = input("Enter your choice: ").strip()
-
         if choice == exit_key:
             print("Exiting the program.")
             break
@@ -116,8 +177,7 @@ def get_user_choice():
             print("Invalid choice. Please try again.")
             continue
 
-        label, func = action
-        print(f"You selected: {label}")
+        _, func = action
         func()
 
 
