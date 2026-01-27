@@ -38,7 +38,7 @@ MPV_FINISH_POLL_INTERVAL = 0.25
 
 # After finish-full-stop, when user does needle-up/needle-down, we try to detect an RFID
 # quickly for this many seconds to restart (same or new record)
-RFID_SCAN_BURST_SECONDS = 2.0
+RFID_SCAN_BURST_SECONDS = 5.0
 # ==========================================================
 
 
