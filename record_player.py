@@ -41,7 +41,6 @@ RFID_SCAN_BURST_SECONDS = 5.0
 
 # Audiobook feature
 AUDIOBOOK_MARKER = "audiobook.json"
-AUDIOBOOK_AUTOSAVE_SECONDS = 60.0
 
 # Audiobook reset gesture
 RESET_LIFT_COUNT = 5
@@ -98,17 +97,17 @@ class MPVController:
     def __init__(self):
         self.rfid_map = self._load_rfid_map()
 
-        # Cache used for non-audiobook resume (same behavior as before)
+        # Cache for non-audiobook resume (same behavior as before)
         self.playback_cache = {
-            "target": None,   # mapped target path (folder/file/playlist)
+            "target": None,   # expanded target path (folder/file/playlist)
             "file": None,     # current file path
             "time_pos": 0.0,  # seconds
         }
 
         # Current context
-        self.current_target = None  # mapped path string from rfid.json (expanded in resolve)
+        self.current_target = None            # expanded folder/file path
         self.current_is_audiobook = False
-        self.current_audiobook_file = None  # full path to audiobook.json (if audiobook)
+        self.current_audiobook_folder = None  # expanded folder path if audiobook
 
         self._proc = None
         self._lock = threading.Lock()
@@ -259,7 +258,6 @@ class MPVController:
     def read_audiobook_state(self, folder: str):
         marker = self._audiobook_marker_path(folder)
         data = _safe_read_json(marker) or {}
-        # normalize
         if data.get("version") is None:
             data["version"] = 1
         if data.get("current_file") is None:
@@ -293,33 +291,30 @@ class MPVController:
     def store_audiobook_progress_if_active(self):
         """
         If current target is audiobook folder and mpv has a path+time, write audiobook.json.
+        Called ONLY on needle lift (pin up) and on finish event.
         """
-        if not self.current_is_audiobook or not self.current_target:
+        folder = self.current_audiobook_folder
+        if not folder or not self.current_is_audiobook:
             return
-        folder = self.current_target
+
+        time_pos = self._get_property("time-pos")
+        path = self._get_property("path")
+
+        if path is None or time_pos is None:
+            return
+
         try:
-            time_pos = self._get_property("time-pos")
-            path = self._get_property("path")
-            if path is None or time_pos is None:
-                return
-            try:
-                time_pos = float(time_pos)
-            except Exception:
-                return
+            time_pos = float(time_pos)
+        except Exception:
+            return
 
-            # Make relative to folder (portable)
-            try:
-                rel = os.path.relpath(path, folder)
-            except Exception:
-                rel = os.path.basename(path)
+        try:
+            rel = os.path.relpath(path, folder)
+        except Exception:
+            rel = os.path.basename(path)
 
-            self.write_audiobook_state(folder, rel, time_pos)
-            # (Optional) keep cache aligned
-            self.playback_cache["target"] = folder
-            self.playback_cache["file"] = path
-            self.playback_cache["time_pos"] = time_pos
-        except Exception as e:
-            print(f"Audiobook progress save failed: {e}")
+        self.write_audiobook_state(folder, rel, time_pos)
+        print(f"Audiobook saved: file={rel}, time={time_pos:.1f}s")
 
     # -----------------------
     # Playback API
@@ -335,15 +330,20 @@ class MPVController:
             print(f"Mapped path is not playable (missing files?): {target_raw}")
             return
 
-        # Determine audiobook status
+        # Determine audiobook status (folder + marker exists)
         is_audiobook = bool(playlist_files) and self._is_audiobook_folder(expanded_target)
+
         self.current_target = expanded_target
         self.current_is_audiobook = is_audiobook
-        self.current_audiobook_file = self._audiobook_marker_path(expanded_target) if is_audiobook else None
+        self.current_audiobook_folder = expanded_target if is_audiobook else None
 
-        # For audiobooks, ensure marker exists
-        if is_audiobook:
+        # For audiobook folders, ensure marker exists (harmless if exists)
+        if bool(playlist_files) and os.path.isdir(expanded_target):
             self.ensure_audiobook_marker(expanded_target)
+            # Re-check after ensuring marker
+            is_audiobook = bool(playlist_files) and self._is_audiobook_folder(expanded_target)
+            self.current_is_audiobook = is_audiobook
+            self.current_audiobook_folder = expanded_target if is_audiobook else None
 
         with self._lock:
             print("Starting playback")
@@ -373,8 +373,8 @@ class MPVController:
                 self._set_property("pause", False)
                 return
 
-            # Non-audiobook: keep old cache resume behavior
-            if target_raw == self.playback_cache.get("target") or expanded_target == self.playback_cache.get("target"):
+            # Non-audiobook resume using cache
+            if expanded_target == self.playback_cache.get("target"):
                 resume_time = float(self.playback_cache.get("time_pos") or 0.0)
                 cached_file = self.playback_cache.get("file")
                 if cached_file:
@@ -389,7 +389,7 @@ class MPVController:
     def pause(self):
         with self._lock:
             self._set_property("pause", True)
-            self.store_playback()
+            self.store_playback_cache_only()
 
     def resume(self):
         with self._lock:
@@ -397,15 +397,10 @@ class MPVController:
 
     def stop(self):
         with self._lock:
-            self.store_playback()
+            self.store_playback_cache_only()
             self._command("stop")
 
     def next_track(self):
-        """
-        Next track with wrap-around:
-        - playlist: normal next, wrap to first at end
-        - single file: restart from beginning
-        """
         with self._lock:
             count = self._get_property("playlist-count")
             pos = self._get_property("playlist-pos")
@@ -442,10 +437,7 @@ class MPVController:
                 print(f"Previous gesture: go to previous track (pos={pos:.2f}s)")
                 self._command("playlist-prev", "force")
 
-    def store_playback(self):
-        """
-        Store playback cache always; also write audiobook.json if audiobook active.
-        """
+    def store_playback_cache_only(self):
         try:
             time_pos = self._get_property("time-pos")
             path = self._get_property("path")
@@ -455,17 +447,11 @@ class MPVController:
             self.playback_cache["file"] = path
             self.playback_cache["target"] = self.current_target or self.playback_cache.get("target")
             print(
-                f"Stored playback: target={self.playback_cache.get('target')}, "
+                f"Stored playback cache: target={self.playback_cache.get('target')}, "
                 f"file={path}, time={self.playback_cache['time_pos']:.1f}s"
             )
         except Exception as e:
-            print(f"Failed to store playback: {e}")
-
-        # audiobook save
-        try:
-            self.store_audiobook_progress_if_active()
-        except Exception:
-            pass
+            print(f"Failed to store playback cache: {e}")
 
     # -------- finish detection helpers --------
 
@@ -531,20 +517,6 @@ class StepperMotor:
 
 
 class RecordPlayer:
-    """
-    - Needle down (magnet present): spin + (resume if media loaded)
-    - Needle up (magnet lost): stop motor + pause
-
-    Gestures while a record is active:
-    - 1 quick lift -> NEXT (fires after DOUBLE_LIFT_WINDOW)
-    - 2 quick lifts -> PREVIOUS (fires after DOUBLE_LIFT_WINDOW)
-    - 5 quick lifts (audiobook only) -> RESET audiobook progress + restart immediately
-
-    Full stop:
-    - Magnet missing >= FULL_STOP_AFTER -> full stop, requires re-scan
-    - Playback finished -> full stop + motor stop + requires needle cycle, then RFID scan burst
-    """
-
     def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
         self.player = player
         self.motor = motor
@@ -559,7 +531,8 @@ class RecordPlayer:
         # gesture state
         self._quick_lift_count = 0
         self._gesture_first_time = None
-        self._gesture_deadline = None  # when to decide between single/double
+        self._gesture_deadline = None
+
         self._full_stop_done = False
 
         # finish lock
@@ -569,9 +542,6 @@ class RecordPlayer:
         # finish detection
         self._next_finish_poll = 0.0
         self._was_playing = False
-
-        # audiobook autosave
-        self._next_audiobook_save = 0.0
 
     def _reset_gesture(self):
         self._quick_lift_count = 0
@@ -588,10 +558,6 @@ class RecordPlayer:
         return None
 
     def _maybe_fire_gesture_action(self, now: float):
-        """
-        Fire NEXT/PREV when the lift window expires.
-        Avoids breaking the 5-lift reset by delaying single/double until window expires.
-        """
         if self.current_rfid is None:
             self._reset_gesture()
             return
@@ -599,29 +565,25 @@ class RecordPlayer:
         if self._gesture_deadline is None or now < self._gesture_deadline:
             return
 
-        # window expired -> decide action
         if self._quick_lift_count == 1:
             print("Gesture: single quick lift -> NEXT track")
             self.player.next_track()
             self.player.resume()
-
         elif self._quick_lift_count == 2:
             print("Gesture: double quick lift -> PREVIOUS (restart-or-prev)")
             self.player.restart_or_prev(PREV_RESTART_THRESHOLD)
             self.player.resume()
 
-        # 3-4 do nothing
         self._reset_gesture()
 
     def _trigger_finish_full_stop(self):
         print("Playback finished → FULL STOP (motor stop, needle cycle + re-scan required)")
 
-        # Save progress once at end
-        if self.player.current_is_audiobook and self.player.current_target:
+        # For audiobooks: save final progress once, then reset to beginning (your choice)
+        if self.player.current_is_audiobook and self.player.current_audiobook_folder:
             try:
                 self.player.store_audiobook_progress_if_active()
-                # and reset audiobook.json to beginning (your preference)
-                self.player.reset_audiobook_state(self.player.current_target)
+                self.player.reset_audiobook_state(self.player.current_audiobook_folder)
                 print("Audiobook finished → progress reset to beginning")
             except Exception as e:
                 print(f"Audiobook finish handling failed: {e}")
@@ -639,7 +601,7 @@ class RecordPlayer:
         now = time.time()
         magnet_detected = bool(self.hall_sensor.value)
 
-        # Fire pending single/double if deadline passed
+        # fire pending single/double
         self._maybe_fire_gesture_action(now)
 
         # init
@@ -649,13 +611,18 @@ class RecordPlayer:
                 self.motor.start()
             return
 
-        # finish-lock mode
+        # finish lock mode
         if self._require_magnet_cycle:
             if not magnet_detected:
                 if not self._saw_magnet_lost_after_finish:
                     print("Finish lock: magnet removed (ok). Now put it back to restart via RFID.")
                 self._saw_magnet_lost_after_finish = True
                 self.motor.stop()
+
+                # save audiobook progress BEFORE pause if any (should be mostly reset already, but safe)
+                if self.player.current_is_audiobook:
+                    self.player.store_audiobook_progress_if_active()
+
                 self.player.pause()
                 self._lift_start_time = now if self._lift_start_time is None else self._lift_start_time
             else:
@@ -672,7 +639,6 @@ class RecordPlayer:
                         self.current_rfid = rfid_id
                         self.player.play(rfid_id)
                         self._was_playing = False
-                        self._next_audiobook_save = now + AUDIOBOOK_AUTOSAVE_SECONDS
                     else:
                         print("No RFID detected after finish (staying silent, motor stop).")
                         self.current_rfid = None
@@ -693,18 +659,14 @@ class RecordPlayer:
             print(f"Magnet detected → start (lift duration {lift_duration:.2f}s)")
             self.motor.start()
 
-            # Only resume if a record is active
             if self.current_rfid is not None:
                 self.player.resume()
 
-            # Quick lift tracking (gesture)
             if lift_duration <= SHORT_LIFT_MAX and self.current_rfid is not None:
-                # Start / continue gesture sequence
                 if self._gesture_first_time is None:
                     self._gesture_first_time = now
                     self._quick_lift_count = 0
 
-                # If sequence took too long, reset and start anew
                 if (now - self._gesture_first_time) > RESET_GESTURE_MAX_TOTAL:
                     self._reset_gesture()
                     self._gesture_first_time = now
@@ -713,15 +675,14 @@ class RecordPlayer:
                 print(f"Quick lift #{self._quick_lift_count}")
 
                 # Audiobook reset: 5 quick lifts
-                if self.player.current_is_audiobook and self.player.current_target:
+                if self.player.current_is_audiobook and self.player.current_audiobook_folder:
                     if self._quick_lift_count >= RESET_LIFT_COUNT and (now - self._gesture_first_time) <= RESET_GESTURE_MAX_TOTAL:
                         print("Gesture: 5 quick lifts -> RESET AUDIOBOOK + restart")
                         try:
-                            self.player.reset_audiobook_state(self.player.current_target)
-                            # restart immediately from beginning
+                            folder = self.player.current_audiobook_folder
+                            self.player.reset_audiobook_state(folder)
                             self.player.play(self.current_rfid, force_restart_audiobook=True)
                             self._was_playing = False
-                            self._next_audiobook_save = now + AUDIOBOOK_AUTOSAVE_SECONDS
                         except Exception as e:
                             print(f"Audiobook reset failed: {e}")
                         self._reset_gesture()
@@ -730,7 +691,6 @@ class RecordPlayer:
                         self._magnet_present = magnet_detected
                         return
 
-                # Delay single/double decision until no further lifts occur
                 self._gesture_deadline = now + DOUBLE_LIFT_WINDOW
 
             elif lift_duration >= LONG_LIFT_MIN:
@@ -745,11 +705,12 @@ class RecordPlayer:
         elif (not magnet_detected) and self._magnet_present:
             print("Magnet lost → stop motor + pause")
             self.motor.stop()
-            self.player.pause()
 
-            # For audiobooks, save immediately on lift
+            # IMPORTANT: for audiobooks, save progress BEFORE pausing
             if self.player.current_is_audiobook:
                 self.player.store_audiobook_progress_if_active()
+
+            self.player.pause()
 
             self._lift_start_time = now
             self._full_stop_done = False
@@ -766,12 +727,6 @@ class RecordPlayer:
                 self._was_playing = False
                 self._reset_gesture()
                 self._full_stop_done = True
-
-        # Audiobook autosave every 60s while playing and needle down
-        if magnet_detected and self.current_rfid is not None and self.player.current_is_audiobook:
-            if now >= self._next_audiobook_save:
-                self.player.store_audiobook_progress_if_active()
-                self._next_audiobook_save = now + AUDIOBOOK_AUTOSAVE_SECONDS
 
         # Reliable finish detection: playing -> idle transition while magnet present
         if magnet_detected and self.current_rfid is not None and now >= self._next_finish_poll:
@@ -796,11 +751,10 @@ class RecordPlayer:
                 self._was_playing = False
                 self._reset_gesture()
                 self.player.play(str(rfid_id))
-                self._next_audiobook_save = now + AUDIOBOOK_AUTOSAVE_SECONDS
 
 
 def main():
-    print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures + Audiobooks")
+    print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures + Audiobooks (save on pin-up only)")
     player = MPVController()
     motor = StepperMotor()
     rfid = SimpleMFRC522()
