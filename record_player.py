@@ -28,15 +28,12 @@ DOUBLE_LIFT_WINDOW = 0.8    # time allowed for a 2nd quick lift (double-lift)
 LONG_LIFT_MIN = 1.5         # if lifted >= this, treat as normal pause (no track skip)
 
 # Previous behavior (seconds)
-# If you're > this many seconds into the track: "previous" restarts current.
-# If you're <= this (e.g., right after restart), "previous" goes to previous track.
 PREV_RESTART_THRESHOLD = 5.0
 
 # Full stop after magnet is missing for this long (seconds)
-# 20 minutes => requires re-scan after coming back
 FULL_STOP_AFTER = 20 * 60
 
-# How often to poll mpv for "finished" state while playing
+# Poll interval for detecting "finished"
 MPV_FINISH_POLL_INTERVAL = 0.25
 
 # After finish-full-stop, when user does needle-up/needle-down, we try to detect an RFID
@@ -250,28 +247,17 @@ class MPVController:
                 count, pos = 0, 0
 
             if count <= 1:
-                # Single file (or no playlist) -> restart
                 self._command("seek", 0, "absolute", "exact")
                 return
 
             if pos >= count - 1:
-                # Last track -> wrap to first
                 self._set_property("playlist-pos", 0)
                 self._command("seek", 0, "absolute", "exact")
                 return
 
-            # Normal next
             self._command("playlist-next", "force")
 
-    def prev_track(self):
-        with self._lock:
-            self._command("playlist-prev", "force")
-
-    def restart_or_prev(self, threshold_seconds: float = PREV_RESTART_THRESHOLD):
-        """
-        If current position > threshold: restart current track.
-        Else: go to previous track.
-        """
+    def restart_or_prev(self, threshold_seconds: float):
         with self._lock:
             pos = self._get_property("time-pos")
             try:
@@ -303,14 +289,25 @@ class MPVController:
 
     # -------- finish detection helpers --------
 
-    def eof_reached(self) -> bool:
+    def is_idle(self) -> bool:
         """
-        True when mpv has reached end-of-file/playlist.
-        Uses mpv property 'eof-reached'. When mpv is idle at end, this becomes True.
+        Reliable end detection:
+        - idle-active/core-idle become True when mpv has nothing playing.
+        These are stable (unlike eof-reached which can be momentary).
         """
         try:
-            v = self._get_property("eof-reached")
-            return bool(v)
+            v1 = self._get_property("idle-active")
+            if v1 is not None:
+                return bool(v1)
+            v2 = self._get_property("core-idle")
+            return bool(v2)
+        except Exception:
+            return False
+
+    def has_loaded_path(self) -> bool:
+        try:
+            p = self._get_property("path")
+            return bool(p)
         except Exception:
             return False
 
@@ -359,22 +356,6 @@ class StepperMotor:
 
 
 class RecordPlayer:
-    """
-    Hall sensor gestures (Option B):
-    - Normal behavior: magnet lost pauses playback; magnet detected resumes.
-    - Quick lift (<= SHORT_LIFT_MAX) then put back:
-        - Single quick lift -> NEXT track (after DOUBLE_LIFT_WINDOW if no second lift)
-        - Double quick lift -> PREVIOUS behavior:
-            * if > PREV_RESTART_THRESHOLD into track -> restart current
-            * else -> previous track
-    - Long lift (>= LONG_LIFT_MIN): normal pause (no skip)
-
-    Full-stop behaviors:
-    1) Magnet missing for >= FULL_STOP_AFTER => FULL STOP + requires re-scan
-    2) Track/album finished => FULL STOP + motor stop + requires needle cycle (magnet off then on)
-       After needle cycle, do a short RFID scan burst; if record is present, start it (same or new).
-    """
-
     def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
         self.player = player
         self.motor = motor
@@ -383,30 +364,30 @@ class RecordPlayer:
 
         self.current_rfid = None
 
-        # Track magnet state transitions
+        # Magnet state transitions
         self._magnet_present = None
         self._lift_start_time = None
 
         # Gesture state
         self._short_lift_count = 0
-        self._pending_single_deadline = None  # when to execute NEXT if no second lift arrives
+        self._pending_single_deadline = None
 
-        # Full stop guard (to avoid calling stop repeatedly)
+        # Full stop guard
         self._full_stop_done = False
 
-        # Finish -> require needle cycle before accepting RFID again
+        # Finish lock (needle cycle required)
         self._require_magnet_cycle = False
         self._saw_magnet_lost_after_finish = False
 
-        # mpv finish polling
+        # Finish detection polling
         self._next_finish_poll = 0.0
+        self._was_playing = False  # track transition: playing -> idle while magnet present
 
     def _reset_gesture(self):
         self._short_lift_count = 0
         self._pending_single_deadline = None
 
     def _scan_rfid_burst(self, seconds: float):
-        """Try to read an RFID quickly for up to `seconds`. Returns rfid_id (str) or None."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             rfid_id = self.rfid.read_id_no_block()
@@ -416,7 +397,7 @@ class RecordPlayer:
         return None
 
     def _maybe_fire_pending_single(self, now: float):
-        # If no record is active (mpv likely has no playlist loaded), gestures shouldn't do anything.
+        # No active record loaded -> gestures shouldn't do anything.
         if self.current_rfid is None:
             self._reset_gesture()
             return
@@ -433,7 +414,9 @@ class RecordPlayer:
         self.player.stop()
         self.motor.stop()
         self.current_rfid = None
+        self._was_playing = False
         self._reset_gesture()
+
         self._require_magnet_cycle = True
         self._saw_magnet_lost_after_finish = False
 
@@ -441,18 +424,17 @@ class RecordPlayer:
         now = time.time()
         magnet_detected = bool(self.hall_sensor.value)
 
-        # Fire pending single-lift action if window elapsed
+        # gestures
         self._maybe_fire_pending_single(now)
 
-        # Initialize on first run
+        # init
         if self._magnet_present is None:
             self._magnet_present = magnet_detected
             if magnet_detected:
                 self.motor.start()
             return
 
-        # If we are in "finish lock" mode, we require: magnet goes away once, then comes back.
-        # After magnet comes back, we do a short RFID scan burst and immediately start playback if a tag is present.
+        # finish-lock mode: require magnet off then on; then scan RFID and play
         if self._require_magnet_cycle:
             if not magnet_detected:
                 if not self._saw_magnet_lost_after_finish:
@@ -467,28 +449,28 @@ class RecordPlayer:
                     self._require_magnet_cycle = False
                     self._saw_magnet_lost_after_finish = False
 
-                    # Needle down -> spin
+                    # Needle down -> start motor
                     self.motor.start()
 
-                    # IMPORTANT: do not resume mpv here; mpv was stopped (playlist unloaded).
-                    # Instead, detect RFID (same record or new record) and play it.
+                    # mpv is stopped/unloaded after finish: do NOT resume; play based on RFID.
                     rfid_id = self._scan_rfid_burst(RFID_SCAN_BURST_SECONDS)
                     if rfid_id:
                         print(f"RFID after finish: {rfid_id} → play")
                         self.current_rfid = rfid_id
                         self.player.play(rfid_id)
+                        self._was_playing = False  # will become True on next poll when mpv is active
                     else:
-                        print("No RFID detected after finish (staying silent).")
+                        print("No RFID detected after finish (staying silent, motor stop).")
                         self.current_rfid = None
-                    # prevent falling through into normal resume/gesture logic
+                        self.motor.stop()
+
                     self._lift_start_time = None
                     self._magnet_present = magnet_detected
                     return
                 else:
-                    # still waiting for the user to remove magnet at least once
                     return
 
-        # Magnet returned
+        # magnet transitions
         if magnet_detected and not self._magnet_present:
             lift_duration = 0.0
             if self._lift_start_time is not None:
@@ -497,55 +479,63 @@ class RecordPlayer:
             print(f"Magnet detected → start (lift duration {lift_duration:.2f}s)")
             self.motor.start()
 
-            # Only resume if we actually have a record active.
+            # Only resume if a record is active
             if self.current_rfid is not None:
                 self.player.resume()
 
+            # gestures only if active record
             if lift_duration <= SHORT_LIFT_MAX and self.current_rfid is not None:
                 self._short_lift_count += 1
                 print(f"Quick lift #{self._short_lift_count}")
 
                 if self._short_lift_count == 1:
                     self._pending_single_deadline = now + DOUBLE_LIFT_WINDOW
-
-                elif self._short_lift_count >= 2:
+                else:
                     print("Gesture: double quick lift -> PREVIOUS (restart-or-prev)")
                     self.player.restart_or_prev(PREV_RESTART_THRESHOLD)
                     self.player.resume()
                     self._reset_gesture()
             else:
-                # if lifted too long or no active record, clear gesture state
                 self._reset_gesture()
 
             self._lift_start_time = None
             self._full_stop_done = False
 
-        # Magnet lost
         elif (not magnet_detected) and self._magnet_present:
             print("Magnet lost → stop motor + pause")
             self.motor.stop()
             self.player.pause()
             self._lift_start_time = now
             self._full_stop_done = False
+            self._was_playing = False  # we're not "playing to finish" while lifted
 
         self._magnet_present = magnet_detected
 
-        # Full stop if magnet missing for long time
+        # full stop if magnet missing too long
         if (not magnet_detected) and self._lift_start_time is not None and (not self._full_stop_done):
             if (now - self._lift_start_time) >= FULL_STOP_AFTER:
                 print("Magnet missing for 20 minutes → FULL STOP (re-scan required)")
                 self.player.stop()
                 self.current_rfid = None
+                self._was_playing = False
                 self._reset_gesture()
                 self._full_stop_done = True
 
-        # If magnet present and we have an active record, poll mpv for finish
-        if magnet_detected and self.current_rfid is not None:
-            if now >= self._next_finish_poll:
-                self._next_finish_poll = now + MPV_FINISH_POLL_INTERVAL
-                if self.player.eof_reached():
-                    self._trigger_finish_full_stop()
-                    return
+        # ----- reliable finish detection: playing -> idle transition while magnet present -----
+        if magnet_detected and self.current_rfid is not None and now >= self._next_finish_poll:
+            self._next_finish_poll = now + MPV_FINISH_POLL_INTERVAL
+
+            idle = self.player.is_idle()
+            loaded = self.player.has_loaded_path()
+
+            # Mark that we were really playing once mpv is not idle and has a path
+            if (not idle) and loaded:
+                self._was_playing = True
+
+            # If we previously were playing and now mpv is idle, treat as finished
+            if self._was_playing and idle:
+                self._trigger_finish_full_stop()
+                return
 
         # RFID handling while spinning (normal)
         if magnet_detected:
@@ -553,6 +543,7 @@ class RecordPlayer:
             if rfid_id and str(rfid_id) != str(self.current_rfid):
                 print(f"RFID changed: {rfid_id}")
                 self.current_rfid = str(rfid_id)
+                self._was_playing = False
                 self._reset_gesture()
                 self.player.play(str(rfid_id))
 
