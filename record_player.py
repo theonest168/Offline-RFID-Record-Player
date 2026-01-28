@@ -401,10 +401,11 @@ class RotaryVolume:
 
                 # If DT is different than CLK on the falling edge, direction is one way.
                 # Swap +/- here if direction feels inverted.
+                # Swap rule for your encoder:
                 if dt_now == 1:
-                    self.player.set_volume(cur + VOLUME_STEP)
+                    self.player.set_volume(cur - VOLUME_STEP)  # <-- down
                 else:
-                    self.player.set_volume(cur - VOLUME_STEP)
+                    self.player.set_volume(cur + VOLUME_STEP)  # <-- up
 
                 # TEMP DEBUG (optional): print volume so you SEE it changing
                 print(f"Volume now: {self.player.get_volume():.0f}")
