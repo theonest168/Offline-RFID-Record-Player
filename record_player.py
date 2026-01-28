@@ -6,8 +6,7 @@ import threading
 import time
 
 import RPi.GPIO as GPIO
-from gpiozero import Button, DigitalInputDevice, DigitalOutputDevice
-from gpiozero.pins.lgpio import LGPIOFactory
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
 from mfrc522 import SimpleMFRC522
 
 HALL_SENSOR_PIN = 17
@@ -23,21 +22,14 @@ MPV_PLAYLIST_TMP = "/tmp/rfid_record_player_playlist.m3u"
 # ==========================================================
 # Gesture timing (seconds)  <-- tweak these to taste
 # ==========================================================
-SHORT_LIFT_MAX = 0.6        # quick lift must be <= this to count as a "gesture"
-DOUBLE_LIFT_WINDOW = 0.8    # time allowed for a 2nd quick lift (double-lift)
-LONG_LIFT_MIN = 1.5         # if lifted >= this, treat as normal pause (no track skip)
+SHORT_LIFT_MAX = 0.6
+DOUBLE_LIFT_WINDOW = 0.8
+LONG_LIFT_MIN = 1.5
 
-# Previous behavior (seconds)
 PREV_RESTART_THRESHOLD = 5.0
 
-# Full stop after magnet is missing for this long (seconds)
 FULL_STOP_AFTER = 20 * 60
-
-# Poll interval for detecting "finished"
 MPV_FINISH_POLL_INTERVAL = 0.25
-
-# After finish-full-stop, when user does needle-up/needle-down, we try to detect an RFID
-# quickly for this many seconds to restart (same or new record)
 RFID_SCAN_BURST_SECONDS = 5.0
 
 # ==========================================================
@@ -47,11 +39,14 @@ ENC_CLK = 13
 ENC_DT = 19
 ENC_SW = 26
 
-VOLUME_STEP = 5          # percent per detent
+VOLUME_STEP = 5
 VOLUME_MIN = 0
-VOLUME_MAX = 80         
-ENC_DEBOUNCE = 0.008    # seconds; tweak 0.001–0.01 if needed
-SW_DEBOUNCE = 0.05
+VOLUME_MAX = 80
+
+# Quadrature decoder settings
+ENC_BOUNCE_MS = 1          # keep low; decoding handles bounce
+SW_BOUNCE_MS = 200
+ENC_STEPS_PER_CLICK = 4    # KY-040 commonly yields 4 valid transitions per detent
 # ==========================================================
 
 
@@ -83,9 +78,9 @@ class MPVController:
     def __init__(self):
         self.rfid_map = self._load_rfid_map()
         self.playback_cache = {
-            "target": None,   # mapped target path (folder/file/playlist)
-            "file": None,     # current file path
-            "time_pos": 0.0,  # seconds
+            "target": None,
+            "file": None,
+            "time_pos": 0.0,
         }
 
         self._proc = None
@@ -219,7 +214,6 @@ class MPVController:
             print("Starting playback")
             self._command("loadfile", play_arg, "replace")
 
-            # Resume if same target and we have cached time
             if target == self.playback_cache.get("target"):
                 resume_time = float(self.playback_cache.get("time_pos") or 0.0)
                 cached_file = self.playback_cache.get("file")
@@ -255,15 +249,9 @@ class MPVController:
             self._command("stop")
 
     def next_track(self):
-        """
-        Next track with wrap-around:
-        - If playlist has a next item: go next
-        - If at end of playlist: jump to first and start at 0s
-        - If single file: restart from beginning
-        """
         with self._lock:
             count = self._get_property("playlist-count")
-            pos = self._get_property("playlist-pos")  # 0-based index
+            pos = self._get_property("playlist-pos")
 
             try:
                 count = int(count) if count is not None else 0
@@ -312,14 +300,7 @@ class MPVController:
         except Exception as e:
             print(f"Failed to store playback: {e}")
 
-    # -------- finish detection helpers --------
-
     def is_idle(self) -> bool:
-        """
-        Reliable end detection:
-        - idle-active/core-idle become True when mpv has nothing playing.
-        These are stable (unlike eof-reached which can be momentary).
-        """
         try:
             v1 = self._get_property("idle-active")
             if v1 is not None:
@@ -337,7 +318,6 @@ class MPVController:
             return False
 
     # -------- volume control (mpv internal) --------
-
     def get_volume(self) -> float:
         v = self._get_property("volume")
         try:
@@ -348,71 +328,107 @@ class MPVController:
     def set_volume(self, vol: float):
         vol = max(VOLUME_MIN, min(VOLUME_MAX, float(vol)))
         self._set_property("volume", vol)
-        # print(f"Volume -> {vol:.0f}")
 
     def toggle_mute(self):
         self._command("cycle", "mute")
-        # m = self._get_property("mute")
-        # print(f"Mute -> {m}")
 
 
 class RotaryVolume:
     """
-    KY-040 rotary encoder:
-    - CLK + DT: rotation
-    - SW: push button
-    Sends volume/mute to MPVController via IPC.
-    Poll-based decoding for reliability.
+    Robust KY-040 decoder using Gray-code transitions (works on bouncy modules).
+    Uses RPi.GPIO interrupts on BOTH edges of CLK and DT, then accumulates transitions.
+    LEFT/RIGHT mapping is set to match your observation (was swapped).
     """
+
+    # Valid transitions (2-bit state: CLK is bit1, DT is bit0)
+    TRANS = {
+        (0, 1): +1, (1, 3): +1, (3, 2): +1, (2, 0): +1,
+        (0, 2): -1, (2, 3): -1, (3, 1): -1, (1, 0): -1,
+    }
 
     def __init__(self, player: MPVController):
         self.player = player
+        self._acc = 0
+        self._lock = threading.Lock()
 
-        self.clk = DigitalInputDevice(ENC_CLK, pull_up=True, pin_factory=LGPIOFactory())
-        self.dt = DigitalInputDevice(ENC_DT, pull_up=True, pin_factory=LGPIOFactory())
-        self.sw = Button(ENC_SW, pull_up=True, bounce_time=SW_DEBOUNCE, pin_factory=LGPIOFactory())
+        GPIO.setup(ENC_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-        self._last_clk = self.clk.value
-        self._last_move = 0.0
+        self._last_state = self._read_state()
 
-        self.sw.when_pressed = self._on_press
+        # Rotary edges
+        GPIO.add_event_detect(
+            ENC_CLK,
+            GPIO.BOTH,
+            callback=self._on_edge,
+            bouncetime=ENC_BOUNCE_MS,
+        )
+        GPIO.add_event_detect(
+            ENC_DT,
+            GPIO.BOTH,
+            callback=self._on_edge,
+            bouncetime=ENC_BOUNCE_MS,
+        )
 
-    def _on_press(self):
+        # Button: press toggles mute
+        GPIO.add_event_detect(
+            ENC_SW,
+            GPIO.FALLING,
+            callback=self._on_button,
+            bouncetime=SW_BOUNCE_MS,
+        )
+
+        # Make sure we start within the cap
+        try:
+            self.player.set_volume(min(self.player.get_volume(), VOLUME_MAX))
+        except Exception:
+            pass
+
+    def _read_state(self) -> int:
+        clk = 1 if GPIO.input(ENC_CLK) else 0
+        dt = 1 if GPIO.input(ENC_DT) else 0
+        return (clk << 1) | dt
+
+    def _on_button(self, channel):
         try:
             self.player.toggle_mute()
         except Exception as e:
             print(f"Encoder button error: {e}")
 
-    def update(self):
-        clk_now = self.clk.value
+    def _on_edge(self, channel):
+        # Very small delay improves stability on some modules
+        time.sleep(0.0005)
 
-        # Only react on falling edge of CLK (1 -> 0)
-        if self._last_clk == 1 and clk_now == 0:
-            t = time.time()
-            if (t - self._last_move) < ENC_DEBOUNCE:
-                self._last_clk = clk_now
+        with self._lock:
+            s = self._read_state()
+            step = self.TRANS.get((self._last_state, s), 0)
+            self._last_state = s
+
+            if step == 0:
                 return
-            self._last_move = t
 
-            dt_now = self.dt.value
+            self._acc += step
 
-            try:
-                cur = self.player.get_volume()
+            # When we've accumulated a full detent worth of transitions -> apply one "click"
+            if self._acc >= ENC_STEPS_PER_CLICK:
+                self._acc = 0
+                # NOTE: Your test showed left/right were swapped, so we invert mapping here:
+                # positive click -> volume DOWN, negative click -> volume UP
+                self._change_volume(-VOLUME_STEP)
 
-                # If DT is different than CLK on the falling edge, direction is one way.
-                # Swap +/- here if direction feels inverted.
-                # Swap rule for your encoder:
-                if dt_now == 1:
-                    self.player.set_volume(cur - VOLUME_STEP)  # <-- down
-                else:
-                    self.player.set_volume(cur + VOLUME_STEP)  # <-- up
+            elif self._acc <= -ENC_STEPS_PER_CLICK:
+                self._acc = 0
+                self._change_volume(+VOLUME_STEP)
 
-                # TEMP DEBUG (optional): print volume so you SEE it changing
-                print(f"Volume now: {self.player.get_volume():.0f}")
-            except Exception as e:
-                print(f"Encoder rotate error: {e}")
-
-        self._last_clk = clk_now
+    def _change_volume(self, delta: float):
+        try:
+            cur = self.player.get_volume()
+            self.player.set_volume(cur + delta)
+            # Uncomment if you want to see it live:
+            # print(f"Volume: {self.player.get_volume():.0f}")
+        except Exception as e:
+            print(f"Encoder rotate error: {e}")
 
 
 class StepperMotor:
@@ -467,24 +483,19 @@ class RecordPlayer:
 
         self.current_rfid = None
 
-        # Magnet state transitions
         self._magnet_present = None
         self._lift_start_time = None
 
-        # Gesture state
         self._short_lift_count = 0
         self._pending_single_deadline = None
 
-        # Full stop guard
         self._full_stop_done = False
 
-        # Finish lock (needle cycle required)
         self._require_magnet_cycle = False
         self._saw_magnet_lost_after_finish = False
 
-        # Finish detection polling
         self._next_finish_poll = 0.0
-        self._was_playing = False  # track transition: playing -> idle while magnet present
+        self._was_playing = False
 
     def _reset_gesture(self):
         self._short_lift_count = 0
@@ -500,7 +511,6 @@ class RecordPlayer:
         return None
 
     def _maybe_fire_pending_single(self, now: float):
-        # No active record loaded -> gestures shouldn't do anything.
         if self.current_rfid is None:
             self._reset_gesture()
             return
@@ -527,17 +537,14 @@ class RecordPlayer:
         now = time.time()
         magnet_detected = bool(self.hall_sensor.value)
 
-        # gestures
         self._maybe_fire_pending_single(now)
 
-        # init
         if self._magnet_present is None:
             self._magnet_present = magnet_detected
             if magnet_detected:
                 self.motor.start()
             return
 
-        # finish-lock mode: require magnet off then on; then scan RFID and play
         if self._require_magnet_cycle:
             if not magnet_detected:
                 if not self._saw_magnet_lost_after_finish:
@@ -552,16 +559,14 @@ class RecordPlayer:
                     self._require_magnet_cycle = False
                     self._saw_magnet_lost_after_finish = False
 
-                    # Needle down -> start motor
                     self.motor.start()
 
-                    # mpv is stopped/unloaded after finish: do NOT resume; play based on RFID.
                     rfid_id = self._scan_rfid_burst(RFID_SCAN_BURST_SECONDS)
                     if rfid_id:
                         print(f"RFID after finish: {rfid_id} → play")
                         self.current_rfid = rfid_id
                         self.player.play(rfid_id)
-                        self._was_playing = False  # will become True on next poll when mpv is active
+                        self._was_playing = False
                     else:
                         print("No RFID detected after finish (staying silent, motor stop).")
                         self.current_rfid = None
@@ -573,7 +578,6 @@ class RecordPlayer:
                 else:
                     return
 
-        # magnet transitions
         if magnet_detected and not self._magnet_present:
             lift_duration = 0.0
             if self._lift_start_time is not None:
@@ -582,11 +586,9 @@ class RecordPlayer:
             print(f"Magnet detected → start (lift duration {lift_duration:.2f}s)")
             self.motor.start()
 
-            # Only resume if a record is active
             if self.current_rfid is not None:
                 self.player.resume()
 
-            # gestures only if active record
             if lift_duration <= SHORT_LIFT_MAX and self.current_rfid is not None:
                 self._short_lift_count += 1
                 print(f"Quick lift #{self._short_lift_count}")
@@ -610,11 +612,10 @@ class RecordPlayer:
             self.player.pause()
             self._lift_start_time = now
             self._full_stop_done = False
-            self._was_playing = False  # we're not "playing to finish" while lifted
+            self._was_playing = False
 
         self._magnet_present = magnet_detected
 
-        # full stop if magnet missing too long
         if (not magnet_detected) and self._lift_start_time is not None and (not self._full_stop_done):
             if (now - self._lift_start_time) >= FULL_STOP_AFTER:
                 print("Magnet missing for 20 minutes → FULL STOP (re-scan required)")
@@ -624,23 +625,19 @@ class RecordPlayer:
                 self._reset_gesture()
                 self._full_stop_done = True
 
-        # ----- reliable finish detection: playing -> idle transition while magnet present -----
         if magnet_detected and self.current_rfid is not None and now >= self._next_finish_poll:
             self._next_finish_poll = now + MPV_FINISH_POLL_INTERVAL
 
             idle = self.player.is_idle()
             loaded = self.player.has_loaded_path()
 
-            # Mark that we were really playing once mpv is not idle and has a path
             if (not idle) and loaded:
                 self._was_playing = True
 
-            # If we previously were playing and now mpv is idle, treat as finished
             if self._was_playing and idle:
                 self._trigger_finish_full_stop()
                 return
 
-        # RFID handling while spinning (normal)
         if magnet_detected:
             rfid_id = self.rfid.read_id_no_block()
             if rfid_id and str(rfid_id) != str(self.current_rfid):
@@ -653,12 +650,16 @@ class RecordPlayer:
 
 def main():
     print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures + KY-040 Volume")
+
+    GPIO.setmode(GPIO.BCM)
+
     player = MPVController()
     motor = StepperMotor()
     rfid = SimpleMFRC522()
-    hall_sensor = DigitalInputDevice(HALL_SENSOR_PIN, pull_up=True, pin_factory=LGPIOFactory())
+    hall_sensor = DigitalInputDevice(HALL_SENSOR_PIN, pull_up=True)
 
-    encoder = RotaryVolume(player)
+    # Start encoder interrupts
+    _encoder = RotaryVolume(player)
 
     rp = RecordPlayer(
         player=player,
@@ -670,8 +671,7 @@ def main():
     try:
         while True:
             rp.update()
-            encoder.update()
-            time.sleep(0.01)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         print("Shutting down...")
     finally:
