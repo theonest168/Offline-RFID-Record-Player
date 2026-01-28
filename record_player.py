@@ -5,8 +5,6 @@ import subprocess
 import threading
 import time
 from gpiozero import RotaryEncoder, Button
-
-import RPi.GPIO as GPIO
 from gpiozero import DigitalInputDevice, DigitalOutputDevice
 from gpiozero.pins.lgpio import LGPIOFactory
 from mfrc522 import SimpleMFRC522
@@ -696,7 +694,6 @@ def main():
         print("Shutting down...")
     finally:
         motor.stop()
-        GPIO.cleanup()
 
 
 if __name__ == "__main__":
