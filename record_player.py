@@ -6,13 +6,24 @@ import threading
 import time
 
 import RPi.GPIO as GPIO
-from gpiozero import DigitalInputDevice, DigitalOutputDevice
 from mfrc522 import SimpleMFRC522
 
+# ==========================================================
+# Pins (BCM numbering)
+# ==========================================================
 HALL_SENSOR_PIN = 17
 STEPPER_PINS = [14, 15, 18, 23]
+
+# KY-040
+ENC_CLK = 13
+ENC_DT = 19
+ENC_SW = 26
+
 RFID_FILE = "rfid.json"
 
+# ==========================================================
+# Audio / mpv
+# ==========================================================
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
 PLAYLIST_EXTS = {".m3u", ".m3u8"}
 
@@ -20,7 +31,7 @@ MPV_SOCKET = "/tmp/rfid_record_player_mpv.sock"
 MPV_PLAYLIST_TMP = "/tmp/rfid_record_player_playlist.m3u"
 
 # ==========================================================
-# Gesture timing (seconds)  <-- tweak these to taste
+# Gesture timing (seconds)
 # ==========================================================
 SHORT_LIFT_MAX = 0.6
 DOUBLE_LIFT_WINDOW = 0.8
@@ -28,25 +39,29 @@ LONG_LIFT_MIN = 1.5
 
 PREV_RESTART_THRESHOLD = 5.0
 
+# Full stop after magnet is missing for this long
 FULL_STOP_AFTER = 20 * 60
+
+# Finish detection
 MPV_FINISH_POLL_INTERVAL = 0.25
+
+# After finish-full-stop, when user does needle-up/needle-down, scan RFID quickly
 RFID_SCAN_BURST_SECONDS = 5.0
 
 # ==========================================================
-# KY-040 Rotary Encoder (BCM pin numbers)
+# Volume
 # ==========================================================
-ENC_CLK = 13
-ENC_DT = 19
-ENC_SW = 26
-
 VOLUME_STEP = 5
 VOLUME_MIN = 0
 VOLUME_MAX = 80
 
-# Quadrature decoder settings
-ENC_BOUNCE_MS = 1          # keep low; decoding handles bounce
+# Rotary decoder
+ENC_BOUNCE_MS = 1
 SW_BOUNCE_MS = 200
-ENC_STEPS_PER_CLICK = 4    # KY-040 commonly yields 4 valid transitions per detent
+ENC_STEPS_PER_CLICK = 4
+
+# If your physical “right turn” is still wrong, flip this
+ENC_INVERT_DIRECTION = False
 # ==========================================================
 
 
@@ -87,7 +102,7 @@ class MPVController:
         self._lock = threading.Lock()
         self._ensure_mpv()
 
-        # Enforce volume cap at startup
+        # Enforce cap at startup
         try:
             self.set_volume(min(self.get_volume(), VOLUME_MAX))
         except Exception:
@@ -228,7 +243,7 @@ class MPVController:
             self._set_property("pause", False)
             self.playback_cache["target"] = target
 
-            # Enforce volume cap whenever playback starts
+            # volume cap
             try:
                 self.set_volume(min(self.get_volume(), VOLUME_MAX))
             except Exception:
@@ -317,13 +332,13 @@ class MPVController:
         except Exception:
             return False
 
-    # -------- volume control (mpv internal) --------
+    # ----- Volume / mute (mpv internal) -----
     def get_volume(self) -> float:
         v = self._get_property("volume")
         try:
             return float(v)
         except Exception:
-            return float(VOLUME_MAX)
+            return 50.0
 
     def set_volume(self, vol: float):
         vol = max(VOLUME_MIN, min(VOLUME_MAX, float(vol)))
@@ -335,12 +350,10 @@ class MPVController:
 
 class RotaryVolume:
     """
-    Robust KY-040 decoder using Gray-code transitions (works on bouncy modules).
-    Uses RPi.GPIO interrupts on BOTH edges of CLK and DT, then accumulates transitions.
-    LEFT/RIGHT mapping is set to match your observation (was swapped).
+    Robust KY-040 decoder using Gray-code transitions.
+    Uses RPi.GPIO interrupts on BOTH edges of CLK and DT and accumulates transitions.
     """
 
-    # Valid transitions (2-bit state: CLK is bit1, DT is bit0)
     TRANS = {
         (0, 1): +1, (1, 3): +1, (3, 2): +1, (2, 0): +1,
         (0, 2): -1, (2, 3): -1, (3, 1): -1, (1, 0): -1,
@@ -357,29 +370,10 @@ class RotaryVolume:
 
         self._last_state = self._read_state()
 
-        # Rotary edges
-        GPIO.add_event_detect(
-            ENC_CLK,
-            GPIO.BOTH,
-            callback=self._on_edge,
-            bouncetime=ENC_BOUNCE_MS,
-        )
-        GPIO.add_event_detect(
-            ENC_DT,
-            GPIO.BOTH,
-            callback=self._on_edge,
-            bouncetime=ENC_BOUNCE_MS,
-        )
+        GPIO.add_event_detect(ENC_CLK, GPIO.BOTH, callback=self._on_edge, bouncetime=ENC_BOUNCE_MS)
+        GPIO.add_event_detect(ENC_DT,  GPIO.BOTH, callback=self._on_edge, bouncetime=ENC_BOUNCE_MS)
+        GPIO.add_event_detect(ENC_SW,  GPIO.FALLING, callback=self._on_button, bouncetime=SW_BOUNCE_MS)
 
-        # Button: press toggles mute
-        GPIO.add_event_detect(
-            ENC_SW,
-            GPIO.FALLING,
-            callback=self._on_button,
-            bouncetime=SW_BOUNCE_MS,
-        )
-
-        # Make sure we start within the cap
         try:
             self.player.set_volume(min(self.player.get_volume(), VOLUME_MAX))
         except Exception:
@@ -397,7 +391,7 @@ class RotaryVolume:
             print(f"Encoder button error: {e}")
 
     def _on_edge(self, channel):
-        # Very small delay improves stability on some modules
+        # tiny delay helps stability
         time.sleep(0.0005)
 
         with self._lock:
@@ -410,23 +404,32 @@ class RotaryVolume:
 
             self._acc += step
 
-            # When we've accumulated a full detent worth of transitions -> apply one "click"
             if self._acc >= ENC_STEPS_PER_CLICK:
                 self._acc = 0
-                # NOTE: Your test showed left/right were swapped, so we invert mapping here:
-                # positive click -> volume DOWN, negative click -> volume UP
-                self._change_volume(-VOLUME_STEP)
+                # positive click is one direction; apply mapping
+                self._apply_click(+1)
 
             elif self._acc <= -ENC_STEPS_PER_CLICK:
                 self._acc = 0
-                self._change_volume(+VOLUME_STEP)
+                self._apply_click(-1)
 
-    def _change_volume(self, delta: float):
+    def _apply_click(self, direction: int):
+        """
+        direction: +1 or -1 from decoder
+        We'll map it to volume up/down.
+        If inverted physically, flip with ENC_INVERT_DIRECTION.
+        """
+        if ENC_INVERT_DIRECTION:
+            direction *= -1
+
+        # IMPORTANT: you said left/right were swapped in the test,
+        # so we invert here so your “right turn” becomes volume UP.
+        # If it ends up wrong, just flip ENC_INVERT_DIRECTION above.
+        delta = -VOLUME_STEP if direction > 0 else +VOLUME_STEP
+
         try:
             cur = self.player.get_volume()
             self.player.set_volume(cur + delta)
-            # Uncomment if you want to see it live:
-            # print(f"Volume: {self.player.get_volume():.0f}")
         except Exception as e:
             print(f"Encoder rotate error: {e}")
 
@@ -445,16 +448,18 @@ class StepperMotor:
     STEP_DELAY = 0.002
 
     def __init__(self):
-        self.pins = [DigitalOutputDevice(pin) for pin in STEPPER_PINS]
         self._running = False
         self._thread = None
+        for pin in STEPPER_PINS:
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, 0)
 
     def _run(self):
         print("Stepper motor thread started")
         while self._running:
             for step in self.STEP_SEQUENCE:
-                for pin, value in zip(self.pins, step):
-                    pin.value = value
+                for pin, val in zip(STEPPER_PINS, step):
+                    GPIO.output(pin, val)
                 time.sleep(self.STEP_DELAY)
         self._stop_pins()
         print("Stepper motor thread stopped")
@@ -470,16 +475,15 @@ class StepperMotor:
         self._running = False
 
     def _stop_pins(self):
-        for pin in self.pins:
-            pin.off()
+        for pin in STEPPER_PINS:
+            GPIO.output(pin, 0)
 
 
 class RecordPlayer:
-    def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522, hall_sensor: DigitalInputDevice):
+    def __init__(self, player: MPVController, motor: StepperMotor, rfid: SimpleMFRC522):
         self.player = player
         self.motor = motor
         self.rfid = rfid
-        self.hall_sensor = hall_sensor
 
         self.current_rfid = None
 
@@ -496,6 +500,9 @@ class RecordPlayer:
 
         self._next_finish_poll = 0.0
         self._was_playing = False
+
+        # hall sensor input
+        GPIO.setup(HALL_SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     def _reset_gesture(self):
         self._short_lift_count = 0
@@ -535,7 +542,7 @@ class RecordPlayer:
 
     def update(self):
         now = time.time()
-        magnet_detected = bool(self.hall_sensor.value)
+        magnet_detected = bool(GPIO.input(HALL_SENSOR_PIN))
 
         self._maybe_fire_pending_single(now)
 
@@ -652,20 +659,20 @@ def main():
     print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures + KY-040 Volume")
 
     GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
 
     player = MPVController()
+
+    # Start KY-040 interrupts (RPi.GPIO)
+    _encoder = RotaryVolume(player)
+
     motor = StepperMotor()
     rfid = SimpleMFRC522()
-    hall_sensor = DigitalInputDevice(HALL_SENSOR_PIN, pull_up=True)
-
-    # Start encoder interrupts
-    _encoder = RotaryVolume(player)
 
     rp = RecordPlayer(
         player=player,
         motor=motor,
         rfid=rfid,
-        hall_sensor=hall_sensor,
     )
 
     try:
