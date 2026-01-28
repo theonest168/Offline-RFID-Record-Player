@@ -4,6 +4,7 @@ import socket
 import subprocess
 import threading
 import time
+from gpiozero import RotaryEncoder, Button
 
 import RPi.GPIO as GPIO
 from gpiozero import DigitalInputDevice, DigitalOutputDevice
@@ -355,82 +356,69 @@ class MPVController:
 
 class RotaryVolume:
     """
-    Robust KY-040 decoder using Gray-code transitions.
-    Uses RPi.GPIO interrupts on BOTH edges of CLK and DT and accumulates transitions.
+    KY-040 volume control using gpiozero (lgpio backend).
+    Avoids mixing RPi.GPIO with LGPIOFactory.
+
+    - Turn: adjusts mpv volume (0..80)
+    - Button: toggles mute
     """
 
-    TRANS = {
-        (0, 1): +1, (1, 3): +1, (3, 2): +1, (2, 0): +1,
-        (0, 2): -1, (2, 3): -1, (3, 1): -1, (1, 0): -1,
-    }
-
-    def __init__(self, player: MPVController):
+    def __init__(
+        self,
+        player: MPVController,
+        clk_pin: int,
+        dt_pin: int,
+        sw_pin: int,
+        step: int = VOLUME_STEP,
+        vmin: int = VOLUME_MIN,
+        vmax: int = VOLUME_MAX,
+        invert: bool = False,
+    ):
         self.player = player
-        self._acc = 0
-        self._lock = threading.Lock()
+        self.step = step
+        self.vmin = vmin
+        self.vmax = vmax
+        self.invert = invert
 
-        # IMPORTANT: Only touch encoder pins via RPi.GPIO; everything else stays gpiozero/lgpio
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
+        # gpiozero devices use same backend as your hall sensor (LGPIOFactory)
+        self.encoder = RotaryEncoder(clk_pin, dt_pin, max_steps=0)  # unlimited
+        self.button = Button(sw_pin, pull_up=True, bounce_time=0.2)
 
-        GPIO.setup(ENC_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        self._last_steps = self.encoder.steps
 
-        self._last_state = self._read_state()
+        self.button.when_pressed = self._on_button
 
-        GPIO.add_event_detect(ENC_CLK, GPIO.BOTH, callback=self._on_edge, bouncetime=ENC_BOUNCE_MS)
-        GPIO.add_event_detect(ENC_DT,  GPIO.BOTH, callback=self._on_edge, bouncetime=ENC_BOUNCE_MS)
-        GPIO.add_event_detect(ENC_SW,  GPIO.FALLING, callback=self._on_button, bouncetime=SW_BOUNCE_MS)
-
-        # Clamp mpv volume at start
+        # clamp volume at startup
         try:
-            self.player.set_volume(min(self.player.get_volume(), VOLUME_MAX))
+            self.player.set_volume(min(self.player.get_volume(), self.vmax))
         except Exception:
             pass
 
-    def _read_state(self) -> int:
-        clk = 1 if GPIO.input(ENC_CLK) else 0
-        dt = 1 if GPIO.input(ENC_DT) else 0
-        return (clk << 1) | dt
-
-    def _on_button(self, channel):
+    def _on_button(self):
         try:
             self.player.toggle_mute()
         except Exception as e:
             print(f"Encoder button error: {e}")
 
-    def _on_edge(self, channel):
-        # tiny delay helps stability on some modules
-        time.sleep(0.0005)
+    def update(self):
+        """
+        Call in main loop. Reads step delta and adjusts volume.
+        """
+        steps = self.encoder.steps
+        delta = steps - self._last_steps
+        if delta == 0:
+            return
+        self._last_steps = steps
 
-        with self._lock:
-            s = self._read_state()
-            step = self.TRANS.get((self._last_state, s), 0)
-            self._last_state = s
+        # direction
+        if self.invert:
+            delta *= -1
 
-            if step == 0:
-                return
-
-            self._acc += step
-
-            if self._acc >= ENC_STEPS_PER_CLICK:
-                self._acc = 0
-                self._apply_click(+1)
-            elif self._acc <= -ENC_STEPS_PER_CLICK:
-                self._acc = 0
-                self._apply_click(-1)
-
-    def _apply_click(self, direction: int):
-        # Your test showed left/right were swapped. This mapping makes your "right turn" increase volume.
-        if ENC_INVERT_DIRECTION:
-            direction *= -1
-
-        delta = -VOLUME_STEP if direction > 0 else +VOLUME_STEP
-
+        # apply change: each step changes volume by VOLUME_STEP
         try:
             cur = self.player.get_volume()
-            self.player.set_volume(cur + delta)
+            new = cur + (delta * self.step)
+            self.player.set_volume(new)
         except Exception as e:
             print(f"Encoder rotate error: {e}")
 
