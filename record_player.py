@@ -6,7 +6,7 @@ import threading
 import time
 
 import RPi.GPIO as GPIO
-from gpiozero import DigitalInputDevice, DigitalOutputDevice
+from gpiozero import Button, DigitalInputDevice, DigitalOutputDevice
 from gpiozero.pins.lgpio import LGPIOFactory
 from mfrc522 import SimpleMFRC522
 
@@ -39,6 +39,19 @@ MPV_FINISH_POLL_INTERVAL = 0.25
 # After finish-full-stop, when user does needle-up/needle-down, we try to detect an RFID
 # quickly for this many seconds to restart (same or new record)
 RFID_SCAN_BURST_SECONDS = 5.0
+
+# ==========================================================
+# KY-040 Rotary Encoder (BCM pin numbers)
+# ==========================================================
+ENC_CLK = 13
+ENC_DT = 19
+ENC_SW = 26
+
+VOLUME_STEP = 5          # percent per detent
+VOLUME_MIN = 0
+VOLUME_MAX = 80          # requested max volume cap
+ENC_DEBOUNCE = 0.002     # seconds; tweak 0.001–0.01 if needed
+SW_DEBOUNCE = 0.05
 # ==========================================================
 
 
@@ -78,6 +91,12 @@ class MPVController:
         self._proc = None
         self._lock = threading.Lock()
         self._ensure_mpv()
+
+        # Enforce volume cap at startup
+        try:
+            self.set_volume(min(self.get_volume(), VOLUME_MAX))
+        except Exception:
+            pass
 
     def _load_rfid_map(self):
         try:
@@ -215,6 +234,12 @@ class MPVController:
             self._set_property("pause", False)
             self.playback_cache["target"] = target
 
+            # Enforce volume cap whenever playback starts
+            try:
+                self.set_volume(min(self.get_volume(), VOLUME_MAX))
+            except Exception:
+                pass
+
     def pause(self):
         with self._lock:
             self._set_property("pause", True)
@@ -310,6 +335,75 @@ class MPVController:
             return bool(p)
         except Exception:
             return False
+
+    # -------- volume control (mpv internal) --------
+
+    def get_volume(self) -> float:
+        v = self._get_property("volume")
+        try:
+            return float(v)
+        except Exception:
+            return float(VOLUME_MAX)
+
+    def set_volume(self, vol: float):
+        vol = max(VOLUME_MIN, min(VOLUME_MAX, float(vol)))
+        self._set_property("volume", vol)
+        # print(f"Volume -> {vol:.0f}")
+
+    def toggle_mute(self):
+        self._command("cycle", "mute")
+        # m = self._get_property("mute")
+        # print(f"Mute -> {m}")
+
+
+class RotaryVolume:
+    """
+    KY-040 rotary encoder:
+    - CLK + DT: rotation
+    - SW: push button
+    Sends volume/mute to MPVController via IPC.
+    Poll-based decoding for reliability.
+    """
+
+    def __init__(self, player: MPVController):
+        self.player = player
+
+        self.clk = DigitalInputDevice(ENC_CLK, pull_up=True, pin_factory=LGPIOFactory())
+        self.dt = DigitalInputDevice(ENC_DT, pull_up=True, pin_factory=LGPIOFactory())
+        self.sw = Button(ENC_SW, pull_up=True, bounce_time=SW_DEBOUNCE, pin_factory=LGPIOFactory())
+
+        self._last_clk = self.clk.value
+        self._last_move = 0.0
+
+        self.sw.when_pressed = self._on_press
+
+    def _on_press(self):
+        try:
+            self.player.toggle_mute()
+        except Exception as e:
+            print(f"Encoder button error: {e}")
+
+    def update(self):
+        clk_now = self.clk.value
+        if clk_now != self._last_clk:
+            t = time.time()
+            if (t - self._last_move) < ENC_DEBOUNCE:
+                self._last_clk = clk_now
+                return
+            self._last_move = t
+
+            dt_now = self.dt.value
+            try:
+                cur = self.player.get_volume()
+                # Direction rule; swap +/- if your encoder feels inverted
+                if dt_now != clk_now:
+                    self.player.set_volume(cur + VOLUME_STEP)
+                else:
+                    self.player.set_volume(cur - VOLUME_STEP)
+            except Exception as e:
+                print(f"Encoder rotate error: {e}")
+
+        self._last_clk = clk_now
 
 
 class StepperMotor:
@@ -549,11 +643,13 @@ class RecordPlayer:
 
 
 def main():
-    print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures")
+    print("Starting Record Player (LOCAL FILES via mpv) + Hall Gestures + KY-040 Volume")
     player = MPVController()
     motor = StepperMotor()
     rfid = SimpleMFRC522()
     hall_sensor = DigitalInputDevice(HALL_SENSOR_PIN, pull_up=True, pin_factory=LGPIOFactory())
+
+    encoder = RotaryVolume(player)
 
     rp = RecordPlayer(
         player=player,
@@ -565,7 +661,8 @@ def main():
     try:
         while True:
             rp.update()
-            time.sleep(0.05)
+            encoder.update()
+            time.sleep(0.01)
     except KeyboardInterrupt:
         print("Shutting down...")
     finally:
