@@ -383,35 +383,35 @@ class RotaryVolume:
         except Exception as e:
             print(f"Encoder button error: {e}")
 
-def update(self):
-    clk_now = self.clk.value
+    def update(self):
+        clk_now = self.clk.value
 
-    # Only react on falling edge of CLK (1 -> 0)
-    if self._last_clk == 1 and clk_now == 0:
-        t = time.time()
-        if (t - self._last_move) < ENC_DEBOUNCE:
-            self._last_clk = clk_now
-            return
-        self._last_move = t
+        # Only react on falling edge of CLK (1 -> 0)
+        if self._last_clk == 1 and clk_now == 0:
+            t = time.time()
+            if (t - self._last_move) < ENC_DEBOUNCE:
+                self._last_clk = clk_now
+                return
+            self._last_move = t
 
-        dt_now = self.dt.value
+            dt_now = self.dt.value
 
-        try:
-            cur = self.player.get_volume()
+            try:
+                cur = self.player.get_volume()
 
-            # If DT is different than CLK on the falling edge, direction is one way.
-            # Swap +/- here if direction feels inverted.
-            if dt_now == 1:
-                self.player.set_volume(cur + VOLUME_STEP)
-            else:
-                self.player.set_volume(cur - VOLUME_STEP)
+                # If DT is different than CLK on the falling edge, direction is one way.
+                # Swap +/- here if direction feels inverted.
+                if dt_now == 1:
+                    self.player.set_volume(cur + VOLUME_STEP)
+                else:
+                    self.player.set_volume(cur - VOLUME_STEP)
 
-            # TEMP DEBUG (optional): print volume so you SEE it changing
-            print(f"Volume now: {self.player.get_volume():.0f}")
-        except Exception as e:
-            print(f"Encoder rotate error: {e}")
+                # TEMP DEBUG (optional): print volume so you SEE it changing
+                print(f"Volume now: {self.player.get_volume():.0f}")
+            except Exception as e:
+                print(f"Encoder rotate error: {e}")
 
-    self._last_clk = clk_now
+        self._last_clk = clk_now
 
 
 class StepperMotor:
