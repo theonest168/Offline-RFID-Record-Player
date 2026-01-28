@@ -56,7 +56,7 @@ SW_BOUNCE_MS = 200
 ENC_STEPS_PER_CLICK = 4
 
 # If volume direction feels inverted, set to True.
-ENC_INVERT_DIRECTION = False
+ENC_INVERT_DIRECTION = True
 # ==========================================================
 
 
