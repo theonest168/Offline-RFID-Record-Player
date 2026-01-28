@@ -542,7 +542,7 @@ class RecordPlayer:
 
     def update(self):
         now = time.time()
-        magnet_detected = bool(GPIO.input(HALL_SENSOR_PIN))
+        magnet_detected = not bool(GPIO.input(HALL_SENSOR_PIN))
 
         self._maybe_fire_pending_single(now)
 
