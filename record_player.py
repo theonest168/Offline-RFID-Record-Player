@@ -664,7 +664,16 @@ def main():
     player = MPVController()
 
     # ---- Add encoder volume control (ONLY addition) ----
-    _encoder = RotaryVolume(player)
+    _encoder = RotaryVolume(
+        player=player,
+        clk_pin=ENC_CLK,
+        dt_pin=ENC_DT,
+        sw_pin=ENC_SW,
+        step=VOLUME_STEP,
+        vmin=VOLUME_MIN,
+        vmax=VOLUME_MAX,
+        invert=False,   # set True if direction is wrong
+        )
     # -----------------------------------------------
 
     motor = StepperMotor()
@@ -680,6 +689,7 @@ def main():
 
     try:
         while True:
+            _encoder.update()
             rp.update()
             time.sleep(0.05)
     except KeyboardInterrupt:
